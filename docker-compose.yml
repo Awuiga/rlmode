@@ -1,49 +1,108 @@
-version: "3.8"
+version: '3.9'
 services:
   redis:
-    image: redis:7
-    ports: ["6379:6379"]
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 20
+    restart: unless-stopped
+
   collector:
     build: .
-    command: python collector.py
+    command: ["python", "-m", "app.collector.main"]
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - APP_CONFIG=/app/config/app.yml
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
-    env_file: .env
-    volumes: ["./config.yml:/app/config.yml"]
+
   signal_engine:
     build: .
-    command: python signal_engine.py
+    command: ["python", "-m", "app.signal_engine.main"]
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - APP_CONFIG=/app/config/app.yml
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
-    env_file: .env
-    depends_on: [redis]
-    volumes: ["./config.yml:/app/config.yml"]
+
   ai_scorer:
     build: .
-    command: python ai_scorer.py
-    restart: unless-stopped
-    env_file: .env
-    depends_on: [redis]
+    command: ["python", "-m", "app.ai_scorer.main"]
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - APP_CONFIG=/app/config/app.yml
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
-      - ./config.yml:/app/config.yml
-      - ./model.onnx:/app/model.onnx
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   executor:
     build: .
-    command: python executor.py
+    command: ["python", "-m", "app.executor.main"]
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - APP_CONFIG=/app/config/app.yml
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
-    env_file: .env
-    depends_on: [redis]
-    volumes: ["./config.yml:/app/config.yml"]
+
   risk:
     build: .
-    command: python risk.py
-    restart: unless-stopped
-    env_file: .env
-    depends_on: [redis]
+    command: ["python", "-m", "app.risk.main"]
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - APP_CONFIG=/app/config/app.yml
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
-      - ./risk.yml:/app/risk.yml
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   monitor:
     build: .
-    command: python monitor.py
+    command: ["python", "-m", "app.monitor.main"]
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - APP_CONFIG=/app/config/app.yml
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
-    env_file: .env
-    depends_on: [redis]
-    ports: ["8000:8000"]
+

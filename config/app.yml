@@ -1,0 +1,72 @@
+# Application configuration
+
+exchange: fake  # options: binance_futs | bybit_perp | fake
+symbols:
+  - BTCUSDT
+
+redis:
+  url: ${REDIS_URL:-redis://localhost:6379/0}
+
+collector:
+  depth_levels: 10
+  ws:
+    binance:
+      url: wss://fstream.binance.com/stream
+    bybit:
+      url: wss://stream.bybit.com/v5/public/linear
+  reconnect_backoff_ms: [500, 1000, 2000, 5000]
+  rate_limit_per_sec: 20
+
+signal_engine:
+  features:
+    depth_top_k: 5
+    sigma_window_ms: 1500
+    ofi_window_ms: 1000
+    ema_window_ms: 2000
+  rules:
+    min_liquidity: 0.5
+    max_spread_ticks: 3
+    sigma_min: 0.0
+    sigma_max: 1.0
+    ofi_buy_min: 0.001
+    ofi_sell_min: 0.001
+    qi_min: -1.0
+    use_trend: false
+  scoring:
+    weights:
+      spread: -0.2
+      sigma: 0.3
+      ofi: 0.3
+      qi: 0.2
+      depth: 0.2
+    theta_emit: 0.6
+  tp_pct: 0.006
+  sl_pct: 0.003
+
+ai_scorer:
+  model_path: /app/models/seq_model.onnx
+  threshold: 0.55
+  batch_size: 32
+  window:
+    frequency_hz: 50
+    seconds: 2
+    depth_levels: 10
+
+executor:
+  ladder:
+    fractions: [0.25, 0.25, 0.25, 0.25]
+    step_ticks: 2
+    use_percent: false
+  tif: GTC
+  post_only: true
+  cancel_timeout_ms: 2500
+  retry_backoff_ms: [200, 400, 800, 1600]
+  adaptive_stop_k: 2.0
+  min_stop: 0.002
+
+risk:
+  enable: true
+
+monitor:
+  http_host: 0.0.0.0
+  http_port: 8000

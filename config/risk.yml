@@ -1,0 +1,8 @@
+daily_loss_limit: -0.03     # -3%
+max_consecutive_losses: 5
+fill_rate_window: 50
+fill_rate_min: 0.25
+markout_max: 0.01
+throttle_rules:
+  reconnect_penalty_s: 10
+
