@@ -13,7 +13,8 @@ from ..common.schema import ApprovedSignal, Order, Fill, TIF, Side, Metric
 from ..common.utils import utc_ms
 from .ladder import build_ladder
 from .positions import Position
-from ..exchange.fake import FakeExchange
+from ..exchange.paper import PaperExchange
+from ..exchange.real import RealExchange
 
 
 log = get_logger("executor")
@@ -30,8 +31,11 @@ def main():
     rs = RedisStream(cfg.redis.url)
     symbols_meta = load_symbols_meta("config/symbols.yml")
 
-    # For now, only fake exchange is implemented end-to-end
-    ex = FakeExchange(symbols_meta)
+    # Choose exchange client based on execution mode
+    if cfg.execution.mode == "paper":
+        ex = PaperExchange(cfg=cfg.execution.simulator, rs=rs, symbols_meta=symbols_meta)
+    else:
+        ex = RealExchange(use=cfg.market.use)
     pos = {sym: Position() for sym in cfg.symbols}
     halted = False
     open_orders: Set[str] = set()
@@ -110,34 +114,17 @@ def main():
                             min_qty=min_qty,
                             use_percent=cfg.executor.ladder.use_percent,
                         )
-                        for price, q in ladder:
+                        for i, (price, q) in enumerate(ladder):
                             order = ex.place_limit_post_only(symbol=sym, side=sig.side, price=price, qty=q, tif=TIF[cfg.executor.tif])
                             open_orders.add(order.client_id)
                             rs.xadd("metrics:executor", Metric(name="open_orders", value=float(len(open_orders))))
-                            # Simulate maker fills based on simple odds
-                            fill_prob = 0.6 if sig.side == Side.BUY else 0.6
-                            if random.random() < fill_prob:
-                                fill = Fill(
-                                    order_id=order.client_id,
-                                    symbol=sym,
-                                    side=sig.side,
-                                    price=price,
-                                    qty=q,
-                                    fee=0.0,
-                                    pnl=(-0.01 if os.environ.get("DRY_RUN_FORCE_LOSSES") == "1" else random.choice([-0.002, 0.002])),
-                                    markout=0.0,
-                                    is_maker=True,
-                                    ts=utc_ms(),
-                                )
-                                # Update position PnL baseline
-                                pos[sym].apply_fill(sig.side.value, price, q)
-                                rs.xadd("exec:fills", fill)
-                                rs.xadd("metrics:executor", Metric(name="trades_total", value=1.0))
-                                rs.xadd("metrics:executor", Metric(name="maker_fills_total", value=1.0))
+                            if isinstance(ex, PaperExchange):
+                                # Simulate fills and publish
+                                ex.simulate_and_publish(order=order, is_last_in_ladder=(i == len(ladder) - 1))
                                 open_orders.discard(order.client_id)
                                 rs.xadd("metrics:executor", Metric(name="open_orders", value=float(len(open_orders))))
                             else:
-                                # Not filled; simulate cancel on timeout
+                                # For real exchange, rely on user-data WS (not implemented here)
                                 time.sleep(cfg.executor.cancel_timeout_ms / 1000.0)
                                 ex.cancel(symbol=sym, client_id=order.client_id)
                                 if order.client_id in open_orders:
