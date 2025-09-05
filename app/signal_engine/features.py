@@ -33,6 +33,10 @@ def compute_features(ev: MarketEvent, state: FeatureState, depth_top_k: int) -> 
     # Spread
     spread = max(0.0, ev.ask1 - ev.bid1)
     features["spread"] = spread
+    # Add raw top-of-book for downstream consumers
+    features["bid1"] = ev.bid1
+    features["ask1"] = ev.ask1
+    features["mid"] = (ev.bid1 + ev.ask1) / 2.0
 
     # Sigma short: std of mid returns over window
     mids = [m for _, m in state.mid_prices]
@@ -64,4 +68,3 @@ def compute_features(ev: MarketEvent, state: FeatureState, depth_top_k: int) -> 
     features["depth_asks"] = topk_asks
 
     return features
-
