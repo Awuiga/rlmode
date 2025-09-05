@@ -48,6 +48,7 @@ Dry run (no exchange)
 - To run a quick local dry-run test without Docker:
   - Install deps (Python 3.11+): `pip install -r requirements.txt`
   - Run e2e pipeline test: `pytest -q`
+  - Or run without pytest runner: `python scripts/run_dry.py`
   - Internally uses `fakeredis://` and limits each service via `DRY_RUN_MAX_ITER`.
 
 Run single service locally

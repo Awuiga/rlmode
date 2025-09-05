@@ -1,61 +1,79 @@
-import asyncio
-import json
+"""
+Legacy entry point kept for compatibility.
+Updated to use Redis Streams and unified schemas.
+"""
+
+from __future__ import annotations
+
 import logging
-from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Any, Dict
 
-import redis.asyncio as redis
-import yaml
+from app.common.config import load_app_config
+from app.common.logging import setup_logging
+from app.common.redis_stream import RedisStream
+from app.common.schema import Candidate, EntryRef, Side, MarketEvent
 
-LOGGER = logging.getLogger("signals")
-
-
-@dataclass
-class SignalCandidate:
-    side: str
-    entry: float
-    tp: float
-    sl: float
-    score: float
-    features: Dict[str, Any]
-
-    def to_json(self) -> str:
-        return json.dumps(self.__dict__)
+LOGGER = logging.getLogger("signals_legacy")
 
 
-class SignalEngine:
-    """Rule based filter that consumes market data and emits trade candidates."""
+def _build_candidate_from_raw(event: Dict[str, Any], tp: float, sl: float) -> Candidate | None:
+    # Fix: read bids/asks from separate fields
+    bids = event.get("data", {}).get("b", [])
+    asks = event.get("data", {}).get("a", [])
+    if not bids or not asks:
+        return None
+    bid = float(bids[0][0])
+    ask = float(asks[0][0])
+    spread = ask - bid
 
-    def __init__(self, config_path: str = "config.yml", redis_url: str = "redis://localhost:6379/0"):
-        with open(config_path) as fh:
-            self.cfg = yaml.safe_load(fh)
-        self.redis = redis.from_url(redis_url)
+    # Minimal rule: require positive spread
+    if spread <= 0:
+        return None
 
-    async def run(self):
-        while True:
-            raw = await self.redis.brpop("raw")
-            event = json.loads(raw[1])
-            sig = self._check_rules(event)
-            if sig:
-                await self.redis.lpush("candidates", sig.to_json())
+    symbol = event.get("stream", "").split("@")[0].upper() or event.get("s", "")
+    ts = int(event.get("E") or event.get("ts") or 0)
 
-    def _check_rules(self, event: Dict[str, Any]) -> SignalCandidate | None:
-        # placeholder: compute basic spread and use threshold
-        book = event.get("data", {}).get("b", [])
-        if not book:
-            return None
-        bid = float(book[0][0])
-        ask = float(book[0][0])
-        spread = ask - bid
-        if spread > self.cfg.get("max_spread", 5.0):
-            return None
-        entry = (ask + bid) / 2
-        tp = entry * (1 + self.cfg["tp"])
-        sl = entry * (1 - self.cfg["sl"])
-        return SignalCandidate("long", entry, tp, sl, score=1.0, features={"spread": spread})
+    features = {"spread": float(spread), "bid1": bid, "ask1": ask, "mid": (bid + ask) / 2.0}
+    side = Side.BUY if spread > 0 else Side.SELL
+    entry_ref = EntryRef(type="limit", offset_ticks=1)
+    return Candidate(ts=ts, symbol=symbol, side=side, entry_ref=entry_ref, tp_pct=tp, sl_pct=sl, features=features, score=0.5)
+
+
+def main():
+    setup_logging()
+    cfg = load_app_config()
+    rs = RedisStream(cfg.redis.url)
+    LOGGER.info("legacy_signal_engine_start")
+    group = "sigeng_legacy"
+    consumer = "c1"
+    streams = ["md:raw"]
+
+    while True:
+        msgs = rs.read_group(group=group, consumer=consumer, streams=streams, block_ms=1000, count=100)
+        if not msgs:
+            continue
+        for stream, items in msgs:
+            for msg_id, data in items:
+                try:
+                    # data might already be normalized MarketEvent; handle both
+                    cand: Candidate | None
+                    try:
+                        ev = MarketEvent.model_validate(data)
+                        bids = ev.bids
+                        asks = ev.asks
+                        if not bids or not asks:
+                            cand = None
+                        else:
+                            features = {"spread": ev.ask1 - ev.bid1, "bid1": ev.bid1, "ask1": ev.ask1, "mid": (ev.ask1 + ev.bid1) / 2}
+                            side = Side.BUY if features["spread"] > 0 else Side.SELL
+                            cand = Candidate(ts=ev.ts, symbol=ev.symbol, side=side, entry_ref=EntryRef(type="limit", offset_ticks=1), tp_pct=cfg.signal_engine.tp_pct, sl_pct=cfg.signal_engine.sl_pct, features=features, score=0.5)
+                    except Exception:
+                        cand = _build_candidate_from_raw(data, cfg.signal_engine.tp_pct, cfg.signal_engine.sl_pct)
+                    if cand:
+                        rs.xadd("sig:candidates", cand)
+                finally:
+                    rs.ack(stream, group, msg_id)
 
 
 if __name__ == "__main__":  # pragma: no cover
-    logging.basicConfig(level=logging.INFO)
-    engine = SignalEngine()
-    asyncio.run(engine.run())
+    main()
