@@ -1,0 +1,8 @@
+websockets
+redis
+pyyaml
+onnxruntime
+lightgbm
+prometheus_client
+requests
+pyarrow
