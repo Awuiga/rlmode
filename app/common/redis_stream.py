@@ -39,6 +39,9 @@ class RedisStream:
             # Otherwise log and continue
             log.warning("xgroup_create_error", stream=stream, group=group, error=str(e))
 
+    def ensure_group(self, stream: str, group: str) -> None:
+        self._ensure_group(stream, group)
+
     def xadd(self, stream: str, data: BaseModel, idempotency_key: Optional[str] = None) -> Optional[str]:
         payload = data.model_dump(mode="json")
         idem_id: Optional[str] = None
@@ -58,17 +61,22 @@ class RedisStream:
         self,
         group: str,
         consumer: str,
-        streams: Iterable[str],
+        streams,
         block_ms: int = 1000,
         count: int = 10,
     ) -> List[Tuple[str, List[Tuple[str, Dict[str, Any]]]]]:
+        # Accept either list of stream names or explicit dict of last IDs
+        if isinstance(streams, dict):
+            names = list(streams.keys())
+            stream_dict = dict(streams)
+        else:
+            names = list(streams)
+            stream_dict = {s: ">" for s in names}
         # Ensure groups exist for all streams
-        for s in streams:
+        for s in names:
             self._ensure_group(s, group)
-        stream_dict = {s: ">" for s in streams}
         result = self.client.xreadgroup(group, consumer, stream_dict, count=count, block=block_ms)
         return result or []
 
     def ack(self, stream: str, group: str, message_id: str) -> int:
         return self.client.xack(stream, group, message_id)
-

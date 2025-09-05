@@ -1,8 +1,11 @@
 # Application configuration
 
-exchange: fake  # options: binance_futs | bybit_perp | fake
-symbols:
-  - BTCUSDT
+exchange_mode: live_paper  # live_paper | live_real
+market:
+  use: fake   # binance_futs | bybit_v5 | fake
+  symbols: [BTCUSDT]
+  binance_ws_public: wss://fstream.binance.com/stream
+  bybit_ws_public:   wss://stream.bybit.com/v5/public
 
 redis:
   url: ${REDIS_URL:-redis://localhost:6379/0}
@@ -63,6 +66,35 @@ executor:
   retry_backoff_ms: [200, 400, 800, 1600]
   adaptive_stop_k: 2.0
   min_stop: 0.002
+
+signals:
+  tp_pct: 0.006
+  sl_pct: 0.003
+  score_threshold: 0.65
+  sigma_window_ms: 1500
+  sigma_min: 0.0004
+  sigma_max: 0.0020
+  ofi_thr: 0.10
+  qi_thr:  0.05
+  ladder: [0.25, 0.25, 0.25, 0.25]
+  ladder_step_ticks: 1
+
+execution:
+  mode: paper
+  simulator:
+    seed: 42
+    base_latency_ms: 15
+    latency_jitter_ms: [2, 8]
+    maker_fill_model: queue
+    taker_slip_bps: [1.0, 4.0]
+    maker_fill_boost_if_qi: 0.15
+    min_partial_fill_qty: 0.25
+    cancel_timeout_ms: 800
+    shock_prob: 0.0005
+    shock_return: [-0.03, -0.10]
+    liquidity_degrade_curve:
+      x: [10000, 50000, 200000, 1000000]
+      y_bps: [1.5, 3.0, 6.0, 20.0]
 
 risk:
   enable: true

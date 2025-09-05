@@ -60,7 +60,18 @@ Run single service locally
 - Monitor: `python -m app.monitor.main` and visit `/metrics`
 
 Configuration
-- config/app.yml: exchange, symbols, redis, thresholds, ladder, stops, AI thresholds, batching
+- Modes:
+  - exchange_mode: live_paper (use live public market data, simulate execution) | live_real (real execution)
+- Market:
+  - market.use: binance_futs | bybit_v5 | fake
+  - market.symbols: [BTCUSDT, ...]
+  - market.binance_ws_public / market.bybit_ws_public: prod WS endpoints (read-only)
+- Execution:
+  - execution.mode: paper | real
+  - execution.simulator: latency, jitter, fill model, taker slip bps, QI boost, partial fills, cancel timeout, shock prob, liquidity degrade curve, fees
+- Signals:
+  - tp_pct/sl_pct, score_threshold, sigma window/min/max, ofi/qi thresholds, ladder and step ticks
+- config/app.yml: all of the above plus redis, AI thresholds, batching, monitor
 - config/symbols.yml: tick_size, lot_step, min_qty, min_notional per symbol
 - config/risk.yml: daily loss limit, max consecutive losses, fill_rate window and min, markout cap
 - .env: API keys and Telegram secrets
