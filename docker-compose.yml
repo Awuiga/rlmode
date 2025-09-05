@@ -1,0 +1,49 @@
+version: "3.8"
+services:
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+  collector:
+    build: .
+    command: python collector.py
+    restart: unless-stopped
+    env_file: .env
+    volumes: ["./config.yml:/app/config.yml"]
+  signal_engine:
+    build: .
+    command: python signal_engine.py
+    restart: unless-stopped
+    env_file: .env
+    depends_on: [redis]
+    volumes: ["./config.yml:/app/config.yml"]
+  ai_scorer:
+    build: .
+    command: python ai_scorer.py
+    restart: unless-stopped
+    env_file: .env
+    depends_on: [redis]
+    volumes:
+      - ./config.yml:/app/config.yml
+      - ./model.onnx:/app/model.onnx
+  executor:
+    build: .
+    command: python executor.py
+    restart: unless-stopped
+    env_file: .env
+    depends_on: [redis]
+    volumes: ["./config.yml:/app/config.yml"]
+  risk:
+    build: .
+    command: python risk.py
+    restart: unless-stopped
+    env_file: .env
+    depends_on: [redis]
+    volumes:
+      - ./risk.yml:/app/risk.yml
+  monitor:
+    build: .
+    command: python monitor.py
+    restart: unless-stopped
+    env_file: .env
+    depends_on: [redis]
+    ports: ["8000:8000"]
