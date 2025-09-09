@@ -37,11 +37,15 @@ def main():
 
     group = "aiscore"
     consumer = "c1"
-    streams = ["sig:candidates"]
+    # Also subscribe to market data to maintain the L2/L1 window buffer
+    streams = ["md:raw", "sig:candidates"]
 
     import os
     max_iters_env = int(os.environ.get("DRY_RUN_MAX_ITER", "0")) if "DRY_RUN_MAX_ITER" in os.environ else None
     processed = 0
+    batch: list[Candidate] = []
+    last_flush = 0.0
+    import time as _time
     while True:
         msgs = rs.read_group(group=group, consumer=consumer, streams=streams, block_ms=1000, count=100)
         if not msgs:
@@ -49,22 +53,37 @@ def main():
         for stream, items in msgs:
             for msg_id, data in items:
                 try:
-                    cand = Candidate.model_validate(data)
-                    # Fallback scoring if ONNX unavailable
-                    if sess is None:
-                        p_succ = max(0.0, min(1.0, cand.score + random.uniform(-0.1, 0.1)))
-                    else:
-                        # Build tensor for symbol from buffer; since we don't receive MD here,
-                        # this is a stub. In production, this service should also subscribe to MD streams.
-                        tensor = wbuf.build_tensor(cand.symbol) or []
-                        # Prepare ONNX inputs as needed; placeholder uses score
-                        p_succ = max(0.0, min(1.0, cand.score))
+                    if stream == "md:raw":
+                        # Feed buffer with market data
+                        from ..common.schema import MarketEvent
 
-                    if p_succ >= cfg.ai_scorer.threshold:
-                        appr = ApprovedSignal(**cand.model_dump(), p_success=p_succ)
-                        rs.xadd("sig:approved", appr)
-                        rs.xadd("metrics:ai", Metric(name="approved_total", value=1.0))
-                        processed += 1
+                        ev = MarketEvent.model_validate(data)
+                        wbuf.push(ev)
+                    else:
+                        cand = Candidate.model_validate(data)
+                        batch.append(cand)
+                        # Flush conditions: batch size or small time window
+                        do_flush = len(batch) >= cfg.ai_scorer.batch_size or (_time.time() - last_flush) > 0.25
+                        if do_flush:
+                            to_score = batch
+                            batch = []
+                            last_flush = _time.time()
+                            # Build tensors per symbol (stubbed)
+                            for c in to_score:
+                                tensor = wbuf.build_tensor(c.symbol)
+                                if tensor is None or len(tensor) == 0:
+                                    log.warning("ai_empty_window", symbol=c.symbol)
+                                    continue
+                                if sess is None:
+                                    p_succ = max(0.0, min(1.0, c.score + random.uniform(-0.05, 0.05)))
+                                else:
+                                    # TODO: real ONNX input mapping
+                                    p_succ = max(0.0, min(1.0, c.score))
+                                if p_succ >= cfg.ai_scorer.threshold:
+                                    appr = ApprovedSignal(**c.model_dump(), p_success=p_succ)
+                                    rs.xadd("sig:approved", appr)
+                                    rs.xadd("metrics:ai", Metric(name="approved_total", value=1.0))
+                                    processed += 1
                 except Exception as e:
                     log.error("ai_scorer_error", error=str(e))
                 finally:

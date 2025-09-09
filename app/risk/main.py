@@ -28,6 +28,10 @@ def main():
     fill_rate_min = float(risk_cfg.get("fill_rate_min", 0.25))
     daily_loss_limit = float(risk_cfg.get("daily_loss_limit", -0.03))
     markout_max = float(risk_cfg.get("markout_max", 0.01))
+    trades_total = 0
+    wins_total = 0
+    maker_total = 0
+    markout_avg = 0.0
 
     log.info("risk_start")
 
@@ -49,13 +53,29 @@ def main():
                     # Use pnl field from fill; for fake it's 0, so approximate by markout
                     trade_pnl = fill.pnl
                     daily_pnl += trade_pnl
-                    win = 1.0 if trade_pnl > 0 else 0.0
-                    consecutive_losses = 0 if trade_pnl > 0 else (consecutive_losses + 1)
-                    window.append(win)
+                    trades_total += 1
+                    if trade_pnl > 0:
+                        wins_total += 1
+                        consecutive_losses = 0
+                    else:
+                        consecutive_losses += 1
+                    window.append(1.0 if trade_pnl > 0 else 0.0)
                     fill_rate = sum(window) / (len(window) or 1)
 
+                    # Maker fraction and rolling markout
+                    if fill.is_maker:
+                        maker_total += 1
+                    # Simple incremental average for markout (placeholder)
+                    markout_avg = ((markout_avg * (trades_total - 1)) + fill.markout) / trades_total
+
+                    # Publish gauges/counters
                     rs.xadd("metrics:risk", Metric(name="daily_pnl", value=daily_pnl))
-                    rs.xadd("metrics:risk", Metric(name="winrate", value=fill_rate))
+                    rs.xadd("metrics:risk", Metric(name="trades_total", value=1.0))
+                    if trade_pnl > 0:
+                        rs.xadd("metrics:risk", Metric(name="wins_total", value=1.0))
+                    rs.xadd("metrics:risk", Metric(name="fill_rate", value=fill_rate))
+                    rs.xadd("metrics:risk", Metric(name="maker_fraction", value=(maker_total / trades_total)))
+                    rs.xadd("metrics:risk", Metric(name="avg_markout", value=markout_avg))
 
                     trigger = None
                     reason = ""
