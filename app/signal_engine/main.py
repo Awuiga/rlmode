@@ -8,7 +8,7 @@ from ..common.logging import setup_logging, get_logger
 from ..common.redis_stream import RedisStream
 from ..common.schema import MarketEvent, Candidate, Metric, Side
 from ..common.utils import utc_ms
-from .features import FeatureState, compute_features
+from ..features.core import FeatureState, compute_features
 from .rules import apply_rules
 
 
