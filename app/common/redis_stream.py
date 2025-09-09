@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Mapping
 
 import redis
 
@@ -10,6 +10,7 @@ except Exception:  # pragma: no cover
     fakeredis = None
 
 from pydantic import BaseModel
+from dataclasses import is_dataclass, asdict
 from .logging import get_logger
 
 
@@ -39,8 +40,28 @@ class RedisStream:
             # Otherwise log and continue
             log.warning("xgroup_create_error", stream=stream, group=group, error=str(e))
 
-    def xadd(self, stream: str, data: BaseModel, idempotency_key: Optional[str] = None) -> Optional[str]:
-        payload = data.model_dump(mode="json")
+    def ensure_group(self, stream: str, group: str) -> None:
+        self._ensure_group(stream, group)
+
+    def xadd(self, stream: str, data: Any, idempotency_key: Optional[str] = None) -> Optional[str]:
+        # Accept Pydantic models, dataclasses, or plain dict-like payloads
+        payload: Dict[str, Any]
+        if isinstance(data, BaseModel):
+            # Pydantic v2: prefer model_dump; fall back gracefully
+            try:
+                payload = data.model_dump(mode="json")  # type: ignore[call-arg]
+            except TypeError:
+                # Some environments may not support the 'mode' arg
+                payload = data.model_dump()  # type: ignore[call-arg]
+        elif hasattr(data, "dict") and callable(getattr(data, "dict")):
+            # Pydantic v1 or objects exposing .dict()
+            payload = dict(data.dict())  # type: ignore[attr-defined]
+        elif is_dataclass(data):
+            payload = asdict(data)
+        elif isinstance(data, Mapping):
+            payload = dict(data)
+        else:
+            raise TypeError(f"xadd unsupported payload type: {type(data)!r}")
         idem_id: Optional[str] = None
         if idempotency_key:
             key = f"idem:{stream}:{idempotency_key}"
@@ -58,17 +79,22 @@ class RedisStream:
         self,
         group: str,
         consumer: str,
-        streams: Iterable[str],
+        streams,
         block_ms: int = 1000,
         count: int = 10,
     ) -> List[Tuple[str, List[Tuple[str, Dict[str, Any]]]]]:
+        # Accept either list of stream names or explicit dict of last IDs
+        if isinstance(streams, dict):
+            names = list(streams.keys())
+            stream_dict = dict(streams)
+        else:
+            names = list(streams)
+            stream_dict = {s: ">" for s in names}
         # Ensure groups exist for all streams
-        for s in streams:
+        for s in names:
             self._ensure_group(s, group)
-        stream_dict = {s: ">" for s in streams}
         result = self.client.xreadgroup(group, consumer, stream_dict, count=count, block=block_ms)
         return result or []
 
     def ack(self, stream: str, group: str, message_id: str) -> int:
         return self.client.xack(stream, group, message_id)
-
