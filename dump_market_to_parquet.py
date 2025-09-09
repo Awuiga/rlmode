@@ -2,376 +2,401 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
-import sys
+import socket
+import tempfile
 import time
-from dataclasses import asdict, is_dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Tuple
-
-try:
-    import orjson as _json  # type: ignore
-except Exception:  # pragma: no cover
-    import json as _json  # type: ignore
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import redis.asyncio as redis
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 
-LOG = logging.getLogger("dump_market")
+# ---------------------- Logging (JSON-one-line) ----------------------
+
+LOG = logging.getLogger("parquet_dumper")
+
+
+def jlog(level: str, event: str, **fields: Any) -> None:
+    payload = {"level": level, "ts": int(time.time() * 1000), "event": event}
+    payload.update(fields)
+    try:
+        line = json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        line = json.dumps({"level": level, "ts": payload["ts"], "event": event})
+    print(line, flush=True)
+
+
+def setup_logging() -> None:
+    logging.basicConfig(level=logging.INFO)
+
+
+# ---------------------- Metrics ----------------------
+
+PARQUET_FLUSH_ROWS = Counter("parquet_flush_rows_total", "Total rows flushed to parquet")
+PARQUET_FLUSH_DURATION = Histogram(
+    "parquet_flush_duration_ms", "Flush duration in milliseconds", buckets=(25, 50, 100, 250, 500, 1000, 2000, 5000)
+)
+REDIS_LAG = Gauge("redis_stream_lag_records", "Redis pending messages for consumer group")
+REDIS_READ_BATCH = Histogram(
+    "redis_read_batch_size", "Batch size of XREADGROUP", buckets=(1, 10, 50, 100, 250, 500, 1000)
+)
+CONSUMER_RESTARTS = Counter("consumer_restarts_total", "Consumer restarts")
+
+
+# ---------------------- Schema ----------------------
+
+SCHEMA_VERSION = "1"
+ARROW_SCHEMA = pa.schema(
+    [
+        ("ts_ms", pa.int64()),
+        ("symbol", pa.string()),
+        ("bid_px", pa.float64()),
+        ("bid_sz", pa.float64()),
+        ("ask_px", pa.float64()),
+        ("ask_sz", pa.float64()),
+        ("last_px", pa.float64()),
+        ("last_sz", pa.float64()),
+        ("side", pa.string()),  # nullable
+        ("event", pa.string()),  # e.g. 'book'/'trade'
+        ("src", pa.string()),
+        ("seq", pa.int64()),  # nullable
+    ]
+)
 
 
 def _utc_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _looks_like_json(s: str) -> bool:
-    s = s.strip()
-    return (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]"))
-
-
 def _to_int_ms(v: Any) -> int:
     try:
         iv = int(float(v))
-        # Heuristic: if value looks like seconds (<= 10^10), convert to ms
         return iv * 1000 if iv < 10_000_000_000 else iv
     except Exception:
         return _utc_ms()
 
 
-def _safe_json_dumps(obj: Any) -> str:
+def _as_float(v: Any) -> Optional[float]:
     try:
-        return _json.dumps(obj).decode("utf-8") if hasattr(_json, "dumps") else _json.dumps(obj)
+        return float(v) if v is not None else None
     except Exception:
-        try:
-            import json as _fallback
-
-            return _fallback.dumps(obj)
-        except Exception:
-            return str(obj)
+        return None
 
 
-def _safe_json_loads(s: str) -> Any:
+def build_row(record: Mapping[str, Any], src: str, default_event: str = "book") -> Dict[str, Any]:
+    # Expect project-native MarketEvent mappings
+    ts_ms = _to_int_ms(record.get("ts", record.get("timestamp")))
+    symbol = record.get("symbol") or record.get("sym")
+    bid_px = _as_float(record.get("bid1"))
+    ask_px = _as_float(record.get("ask1"))
+    # Sizes from depth top-1 if available
+    bid_sz = None
+    ask_sz = None
+    bids = record.get("bids") or []
+    asks = record.get("asks") or []
     try:
-        return _json.loads(s)  # type: ignore[attr-defined]
+        if isinstance(bids, list) and bids:
+            bid_sz = _as_float(bids[0][1])
+        if isinstance(asks, list) and asks:
+            ask_sz = _as_float(asks[0][1])
     except Exception:
+        pass
+    last = record.get("last_trade") or {}
+    last_px = _as_float(last.get("price")) if isinstance(last, Mapping) else None
+    last_sz = _as_float(last.get("qty")) if isinstance(last, Mapping) else None
+    side = last.get("side") if isinstance(last, Mapping) else None
+    event = record.get("event") or default_event
+    seq = record.get("seq")
+    try:
+        seq = int(seq) if seq is not None else None
+    except Exception:
+        seq = None
+    return {
+        "ts_ms": int(ts_ms),
+        "symbol": str(symbol) if symbol is not None else None,
+        "bid_px": bid_px,
+        "bid_sz": bid_sz,
+        "ask_px": ask_px,
+        "ask_sz": ask_sz,
+        "last_px": last_px,
+        "last_sz": last_sz,
+        "side": None if side is None else str(side),
+        "event": str(event),
+        "src": str(src),
+        "seq": seq,
+    }
+
+
+class Deduper:
+    def __init__(self, max_size: int = 200_000):
+        from collections import deque
+
+        self._set: set[Tuple[Any, Any, Any]] = set()
+        self._dq: "deque[Tuple[Any, Any, Any]]" = deque()
+        self._max = max_size
+
+    def seen(self, symbol: Any, ts_ms: Any, last_px: Any) -> bool:
+        key = (symbol, ts_ms, last_px)
+        if key in self._set:
+            return True
+        self._set.add(key)
+        self._dq.append(key)
+        if len(self._dq) > self._max:
+            old = self._dq.popleft()
+            self._set.discard(old)
+        return False
+
+
+@dataclass
+class FlushChunk:
+    rows: List[Dict[str, Any]]
+    min_ts: int
+    max_ts: int
+    symbols: List[str]
+
+
+class ParquetWriter:
+    def __init__(self, out_root: str, roll: str, src: str):
+        self.out_root = out_root
+        self.roll = roll  # 'hourly' | 'daily'
+        self.src = src
+        os.makedirs(self.out_root, exist_ok=True)
+
+    def _partition_dir(self, ts_ms: int) -> str:
+        dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        date_dir = os.path.join(self.out_root, f"date={dt.strftime('%Y-%m-%d')}")
+        if self.roll == "hourly":
+            return os.path.join(date_dir, f"hour={dt.strftime('%H')}")
+        return date_dir
+
+    def _choose_filename(self, min_ts: int, max_ts: int, rows: int) -> str:
+        return f"{min_ts}-{max_ts}_{rows}.parquet"
+
+    def _sidecar_path(self, parquet_path: str) -> str:
+        root, _ = os.path.splitext(parquet_path)
+        return root + ".json"
+
+    def flush_atomic(self, chunk: FlushChunk) -> str:
+        # Build DataFrame in fixed column order, enforce schema with pyarrow
+        df = pd.DataFrame(chunk.rows, columns=[f.name for f in ARROW_SCHEMA])
+        table = pa.Table.from_pandas(df, schema=ARROW_SCHEMA, preserve_index=False)
+        # Paths
+        out_dir = self._partition_dir(chunk.min_ts)
+        os.makedirs(out_dir, exist_ok=True)
+        fname = self._choose_filename(chunk.min_ts, chunk.max_ts, len(chunk.rows))
+        final_path = os.path.join(out_dir, fname)
+        # Atomic write: tmp file then replace
+        with tempfile.NamedTemporaryFile(dir=out_dir, prefix=".tmp_parq_", suffix=".parquet", delete=False) as tmp:
+            tmp_path = tmp.name
         try:
-            import json as _fallback
-
-            return _fallback.loads(s)
-        except Exception:
-            return s
-
-
-def _canonical_row(
-    record: Mapping[str, Any],
-    stream_id: str,
-) -> Dict[str, Any]:
-    # If record is a wrapper containing a single JSON payload field, unwrap
-    if len(record) == 1:
-        k = next(iter(record))
-        v = record[k]
-        if isinstance(v, (bytes, bytearray)):
+            pq.write_table(table, tmp_path, compression="snappy")
+            os.replace(tmp_path, final_path)
+        finally:
             try:
-                v = v.decode("utf-8")
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
             except Exception:
                 pass
-        if isinstance(v, str) and _looks_like_json(v):
-            try:
-                parsed = _safe_json_loads(v)
-                if isinstance(parsed, Mapping):
-                    record = parsed  # type: ignore[assignment]
-            except Exception:
-                pass
-
-    # Flatten supported fields and keep extras minimal
-    row: Dict[str, Any] = {}
-    # Timestamp
-    ts_val = record.get("ts") or record.get("timestamp")
-    row["ts"] = _to_int_ms(ts_val) if ts_val is not None else _utc_ms()
-    # Symbol
-    sym = record.get("symbol") or record.get("sym")
-    if isinstance(sym, (bytes, bytearray)):
-        try:
-            sym = sym.decode("utf-8")
-        except Exception:
-            pass
-    row["symbol"] = sym
-    # Top of book
-    for f in ("bid1", "ask1"):
-        val = record.get(f)
-        try:
-            row[f] = float(val) if val is not None else None
-        except Exception:
-            row[f] = None
-    # Depth/last trade (store as JSON string for compactness and schema stability)
-    for f in ("bids", "asks"):
-        v = record.get(f)
-        if isinstance(v, str) and _looks_like_json(v):
-            row[f] = v
-        elif isinstance(v, (list, tuple)):
-            row[f] = _safe_json_dumps(v)
-        else:
-            # best-effort parse, otherwise keep as string
-            try:
-                row[f] = _safe_json_dumps(_safe_json_loads(v)) if isinstance(v, str) else (str(v) if v is not None else None)
-            except Exception:
-                row[f] = str(v) if v is not None else None
-
-    lt = record.get("last_trade")
-    if isinstance(lt, str) and _looks_like_json(lt):
-        try:
-            lt = _safe_json_loads(lt)
-        except Exception:
-            pass
-    if isinstance(lt, Mapping):
-        row["last_trade_price"] = (
-            float(lt.get("price")) if lt.get("price") is not None else None
-        )
-        row["last_trade_qty"] = (
-            float(lt.get("qty")) if lt.get("qty") is not None else None
-        )
-        side = lt.get("side")
-        if isinstance(side, (bytes, bytearray)):
-            try:
-                side = side.decode("utf-8")
-            except Exception:
-                pass
-        row["last_trade_side"] = side
-    else:
-        row["last_trade_price"] = None
-        row["last_trade_qty"] = None
-        row["last_trade_side"] = None
-
-    # Keep stream id for traceability
-    row["stream_id"] = stream_id
-    return row
+        # Sidecar metadata
+        sidecar = {
+            "min_ts": chunk.min_ts,
+            "max_ts": chunk.max_ts,
+            "row_count": len(chunk.rows),
+            "schema_ver": SCHEMA_VERSION,
+            "src": self.src,
+            "symbols": sorted(set(chunk.symbols)),
+        }
+        with open(self._sidecar_path(final_path), "w", encoding="utf-8") as f:
+            json.dump(sidecar, f)
+        return final_path
 
 
-class ParquetSink:
-    def __init__(self, out_dir: str, engine: str = "pyarrow") -> None:
-        self.out_dir = out_dir
-        self.engine = engine
-        self._writers: Dict[str, Any] = {}  # hour_key -> writer (pyarrow)
-        self._schemas: Dict[str, Any] = {}
-        self._paths: Dict[str, str] = {}
-        if engine not in ("pyarrow", "fastparquet"):
-            raise ValueError("engine must be 'pyarrow' or 'fastparquet'")
-        if engine == "pyarrow":
-            try:
-                import pyarrow as pa  # noqa: F401
-                import pyarrow.parquet as pq  # noqa: F401
-            except Exception as e:  # pragma: no cover
-                raise RuntimeError("pyarrow is required for engine='pyarrow'") from e
-
-    def _file_path(self, hour_key: str) -> str:
-        return os.path.join(self.out_dir, f"{hour_key}.parquet")
-
-    def _unique_path(self, base_path: str) -> str:
-        if not os.path.exists(base_path):
-            return base_path
-        root, ext = os.path.splitext(base_path)
-        i = 1
-        while True:
-            cand = f"{root}_{i}{ext}"
-            if not os.path.exists(cand):
-                return cand
-            i += 1
-
-    def _ensure_dir(self) -> None:
-        os.makedirs(self.out_dir, exist_ok=True)
-
-    def write(self, hour_key: str, df: pd.DataFrame) -> None:
-        self._ensure_dir()
-        # Resolve target path
-        path = self._paths.get(hour_key)
-        if not path:
-            base = self._file_path(hour_key)
-            if self.engine == "pyarrow":
-                # Avoid clobbering existing files across restarts
-                path = self._unique_path(base)
-            else:
-                path = base
-            self._paths[hour_key] = path
-        if self.engine == "fastparquet":
-            append = os.path.exists(path)
-            df.to_parquet(path, engine="fastparquet", index=False, compression="snappy", append=append)
-            LOG.info("saved_parquet path=%s rows=%d", path, len(df))
+async def ensure_group(r: redis.Redis, stream: str, group: str) -> None:
+    try:
+        await r.xgroup_create(stream, group, id="$", mkstream=True)
+        jlog("info", "xgroup_create", stream=stream, group=group)
+    except Exception as e:
+        msg = str(e)
+        if "BUSYGROUP" in msg:
             return
-
-        # pyarrow: keep a writer open per hour_key for appends within process lifetime
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-
-        table = pa.Table.from_pandas(df)
-        writer = self._writers.get(hour_key)
-        if writer is None:
-            writer = pq.ParquetWriter(path, table.schema, compression="snappy")
-            self._writers[hour_key] = writer
-            self._schemas[hour_key] = table.schema
-        else:
-            # Align to schema if columns drift
-            schema = self._schemas[hour_key]
-            if table.schema != schema:
-                # Reorder/add missing columns as nulls
-                cols = [c.name for c in schema]
-                for c in cols:
-                    if c not in df.columns:
-                        df[c] = None
-                df = df[cols]
-                table = pa.Table.from_pandas(df)
-        writer.write_table(table)
-        LOG.info("saved_parquet path=%s rows=%d", path, len(df))
-
-    def close(self) -> None:
-        if self.engine == "pyarrow":
-            for k, w in list(self._writers.items()):
-                try:
-                    w.close()
-                except Exception:  # pragma: no cover
-                    pass
-            self._writers.clear()
-            self._schemas.clear()
+        jlog("error", "xgroup_create_failed", stream=stream, group=group, error=msg)
 
 
-async def _read_stream(
+async def get_group_lag(r: redis.Redis, stream: str, group: str) -> int:
+    try:
+        info = await r.xpending(stream, group)
+        # Returns PendingInfo (count, min, max, consumers). We care about count.
+        return int(info[0]) if isinstance(info, (list, tuple)) and info else 0
+    except Exception:
+        return 0
+
+
+async def consume(
     r: redis.Redis,
     stream: str,
-    start_id: str,
-    buffer_max: int,
-    flush_interval_sec: int,
+    group: str,
+    consumer: str,
     out_dir: str,
-    engine: str,
-    block_ms: int,
+    roll: str,
+    src: str,
+    max_batch: int,
+    flush_seconds: int,
+    idle_ms: int,
     stop_event: asyncio.Event,
 ) -> None:
-    last_id = start_id
-    buffers: Dict[str, List[Dict[str, Any]]] = {}  # hour_key -> rows
-    sink = ParquetSink(out_dir, engine=engine)
-    last_flush = time.monotonic()
+    writer = ParquetWriter(out_dir, roll=roll, src=src)
+    dedup = Deduper()
+    last_flush_t = time.monotonic()
+    to_write: List[Dict[str, Any]] = []
+    ack_ids: List[str] = []
+    symbols_accum: List[str] = []
+    min_ts = 2**63 - 1
+    max_ts = 0
+    await ensure_group(r, stream, group)
+    jlog("info", "consumer_started", stream=stream, group=group, consumer=consumer)
 
-    async def flush(reason: str = "periodic") -> None:
-        nonlocal buffers, last_flush
-        if not any(buffers.values()):
-            last_flush = time.monotonic()
-            return
-        for hour_key, rows in list(buffers.items()):
-            if not rows:
-                continue
-            df = pd.DataFrame(rows)
-            try:
-                sink.write(hour_key, df)
-            except Exception:
-                LOG.exception("parquet_write_failed hour=%s", hour_key)
-            buffers[hour_key] = []
-        last_flush = time.monotonic()
+    cur_max_batch = max_batch
+    cur_idle_ms = idle_ms
+    LAG_HIGH = 10000
+    LAG_LOW = 1000
+    while not stop_event.is_set():
+        try:
+            lag = await get_group_lag(r, stream, group)
+            REDIS_LAG.set(lag)
+            # Simple latency guards: adapt batch/idle based on lag
+            if lag > LAG_HIGH:
+                cur_max_batch = max(1000, max_batch // 2)
+                cur_idle_ms = min(2000, idle_ms * 2)
+            elif lag < LAG_LOW:
+                cur_max_batch = max_batch
+                cur_idle_ms = idle_ms
 
-    try:
-        while not stop_event.is_set():
-            try:
-                resp = await r.xread({stream: last_id}, block=block_ms, count=100)
-            except Exception:
-                LOG.exception("xread_failed")
-                await asyncio.sleep(1.0)
-                continue
+            resp = await r.xreadgroup(group, consumer, streams={stream: ">"}, count=cur_max_batch, block=cur_idle_ms)
+        except Exception as e:
+            CONSUMER_RESTARTS.inc()
+            jlog("error", "xreadgroup_failed", error=str(e))
+            await asyncio.sleep(1.0)
+            continue
 
-            if not resp:
-                # Check time-based flush
-                if time.monotonic() - last_flush >= flush_interval_sec:
-                    await flush("interval")
-                continue
-
-            for _stream_name, messages in resp:
-                for msg_id, data in messages:
-                    # data is Mapping[str, str]; convert and normalize
+        batch_size = 0
+        if resp:
+            # resp is list of (stream, [(id, data), ...])
+            for _s, msgs in resp:
+                batch_size += len(msgs)
+                for msg_id, data in msgs:
                     try:
                         record = data if isinstance(data, Mapping) else {}
-                        row = _canonical_row(record, stream_id=msg_id)
-                    except Exception:
-                        LOG.exception("parse_failed")
-                        continue
+                        row = build_row(record, src=src)
+                        if dedup.seen(row["symbol"], row["ts_ms"], row["last_px"]):
+                            continue
+                        to_write.append(row)
+                        ack_ids.append(msg_id)
+                        symbols_accum.append(row["symbol"])  # type: ignore[arg-type]
+                        ts = int(row["ts_ms"]) if row["ts_ms"] is not None else _utc_ms()
+                        if ts < min_ts:
+                            min_ts = ts
+                        if ts > max_ts:
+                            max_ts = ts
+                    except Exception as e:
+                        jlog("error", "parse_failed", error=str(e))
+        REDIS_READ_BATCH.observe(batch_size)
 
-                    # Decide hour by event ts (UTC)
-                    dt = datetime.fromtimestamp((row.get("ts") or _utc_ms()) / 1000.0, tz=timezone.utc)
-                    hour_key = dt.strftime("%Y%m%d_%H")
-                    buflist = buffers.setdefault(hour_key, [])
-                    buflist.append(row)
+        # Flush by time or size
+        now = time.monotonic()
+        do_flush = (len(to_write) >= max_batch) or ((now - last_flush_t) >= flush_seconds)
+        if do_flush and to_write:
+            t0 = time.perf_counter()
+            try:
+                chunk = FlushChunk(rows=to_write, min_ts=min_ts, max_ts=max_ts, symbols=symbols_accum)
+                path = writer.flush_atomic(chunk)
+                await r.xack(stream, group, *ack_ids)
+                dur_ms = int((time.perf_counter() - t0) * 1000)
+                PARQUET_FLUSH_ROWS.inc(len(to_write))
+                PARQUET_FLUSH_DURATION.observe(dur_ms)
+                jlog(
+                    "info",
+                    "parquet_flush",
+                    rows=len(to_write),
+                    path=path,
+                    lag_ms=max(0, _utc_ms() - max_ts),
+                    redis_lag=int(REDIS_LAG._value.get()),  # type: ignore[attr-defined]
+                )
+            except Exception as e:
+                jlog("error", "flush_failed", error=str(e))
+            finally:
+                to_write = []
+                ack_ids = []
+                symbols_accum = []
+                min_ts = 2**63 - 1
+                max_ts = 0
+                last_flush_t = now
 
-                    # Batching flush
-                    total = sum(len(v) for v in buffers.values())
-                    if total >= buffer_max:
-                        await flush("batch")
-                # Advance last_id to the last message id we saw from this read
-                if messages:
-                    last_id = messages[-1][0]
-
-            # Interval flush check
-            if time.monotonic() - last_flush >= flush_interval_sec:
-                await flush("interval")
-    finally:
-        try:
-            await flush("shutdown")
-        finally:
-            sink.close()
+        # Heartbeat when idle
+        if not resp and (now - last_flush_t) >= max(1, flush_seconds // 2):
+            jlog("info", "heartbeat", redis_lag=int(REDIS_LAG._value.get()))  # type: ignore[attr-defined]
 
 
 async def main_async(args: argparse.Namespace) -> None:
-    r = redis.from_url(args.redis, decode_responses=True)
+    # Metrics HTTP server
+    if args.metrics_port:
+        start_http_server(args.metrics_port, addr=args.metrics_host)
+        jlog("info", "metrics_http_started", host=args.metrics_host, port=args.metrics_port)
 
+    r = redis.from_url(args.redis, decode_responses=True)
     stop_event = asyncio.Event()
 
     def _graceful() -> None:
-        LOG.info("shutdown_signal_received")
         stop_event.set()
+        jlog("info", "shutdown_signal")
 
     loop = asyncio.get_running_loop()
-    # Signal handlers (best-effort on Windows)
-    try:
-        loop.add_signal_handler(signal.SIGINT, _graceful)
-    except (NotImplementedError, RuntimeError):  # pragma: no cover
-        pass
-    try:
-        loop.add_signal_handler(signal.SIGTERM, _graceful)
-    except (AttributeError, NotImplementedError, RuntimeError):  # pragma: no cover
-        pass
+    for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, _graceful)
+        except Exception:
+            pass
 
-    start_id = "$" if args.from_latest else "0-0"
-    await _read_stream(
+    await consume(
         r=r,
         stream=args.stream,
-        start_id=start_id,
-        buffer_max=args.batch,
-        flush_interval_sec=args.interval,
+        group=args.group,
+        consumer=args.consumer or f"{socket.gethostname()}-{os.getpid()}",
         out_dir=args.out,
-        engine=args.engine,
-        block_ms=args.block_ms,
+        roll=args.roll,
+        src=args.src,
+        max_batch=args.max_batch,
+        flush_seconds=args.flush_seconds,
+        idle_ms=args.idle_ms,
         stop_event=stop_event,
     )
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Dump market stream to hourly Parquet files")
+    p = argparse.ArgumentParser(description="Dump Redis Stream market data to partitioned Parquet files")
     p.add_argument("--redis", default="redis://localhost:6379/0", help="Redis URL")
     p.add_argument("--stream", default="md:raw", help="Redis stream name")
-    p.add_argument("--batch", type=int, default=10_000, help="Flush after N records")
-    p.add_argument("--interval", type=int, default=60, help="Flush interval seconds")
-    p.add_argument("--out", default="./data/market", help="Output directory")
-    p.add_argument("--engine", choices=["pyarrow", "fastparquet"], default="pyarrow", help="Parquet engine")
-    p.add_argument("--from-latest", dest="from_latest", action="store_true", help="Start from latest ($)")
-    p.add_argument("--from-start", dest="from_latest", action="store_false", help="Start from 0-0")
-    p.add_argument("--block-ms", type=int, default=1000, help="XREAD block timeout in ms")
-    p.set_defaults(from_latest=True)
+    p.add_argument("--out", default="./data/parquet", help="Output root directory")
+    p.add_argument("--roll", choices=["hourly", "daily"], default="hourly", help="Partition roll up")
+    p.add_argument("--max-batch", dest="max_batch", type=int, default=25_000, help="Max rows per flush")
+    p.add_argument("--idle-ms", dest="idle_ms", type=int, default=500, help="XREADGROUP block (ms)")
+    p.add_argument("--group", default="parquet:grp", help="Consumer group name")
+    p.add_argument("--consumer", default=None, help="Consumer name (default hostname-pid)")
+    p.add_argument("--flush-seconds", dest="flush_seconds", type=int, default=10, help="Flush interval seconds")
+    p.add_argument("--src", default="unknown", help="Source tag: bybit_v5 | binance_futs | ...")
+    p.add_argument("--metrics-host", default="0.0.0.0", help="Metrics HTTP host")
+    p.add_argument("--metrics-port", type=int, default=8001, help="Metrics HTTP port")
     return p.parse_args(argv)
-
-
-def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
 
 
 def main() -> None:
@@ -379,8 +404,8 @@ def main() -> None:
     args = parse_args()
     try:
         asyncio.run(main_async(args))
-    except KeyboardInterrupt:  # pragma: no cover
-        LOG.info("keyboard_interrupt")
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
