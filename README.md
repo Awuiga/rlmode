@@ -65,7 +65,20 @@ Configuration
 - Market:
   - market.use: binance_futs | bybit_v5 | fake
   - market.symbols: [BTCUSDT, ...]
+  - market.category: linear | spot | inverse (Bybit v5 WS)
   - market.binance_ws_public / market.bybit_ws_public: prod WS endpoints (read-only)
+    - Bybit URL is composed as `wss://stream.bybit.com/v5/public/<category>` with AWS fallback
+
+Example (Bybit spot):
+
+```
+market:
+  use: bybit_v5
+  category: spot
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+```
 - Execution:
   - execution.mode: paper | real
   - execution.simulator: latency, jitter, fill model, taker slip bps, QI boost, partial fills, cancel timeout, shock prob, liquidity degrade curve, fees
@@ -78,6 +91,41 @@ Configuration
 
 Redis Streams
 - md:raw, sig:candidates, sig:approved, exec:fills, control:events, metrics:*
+
+Data collection (Parquet dumper)
+- Local run:
+  - pip install -r requirements.txt
+  - export REDIS_URL=redis://localhost:6379/0
+  - python -m app.collector.main
+  - python dump_market_to_parquet.py --stream md:raw --out ./data/parquet --roll hourly --max-batch 25000 --idle-ms 500 --group parquet:grp --consumer $(hostname)-$$ --flush-seconds 10 --src bybit_v5
+- Docker:
+  - docker compose up -d redis
+  - docker compose up -d collector
+  - docker compose up -d monitor
+  - docker compose up -d parquet-dumper
+  - docker compose logs -f parquet-dumper
+
+Files appear under ./data/parquet/date=YYYY-MM-DD/hour=HH/*.parquet with sidecar *.json containing min_ts, max_ts, row_count, schema_ver, src, symbols.
+
+Prometheus scrape example:
+
+```
+scrape_configs:
+  - job_name: 'monitor'
+    static_configs:
+      - targets: ['localhost:8000']
+  - job_name: 'parquet_dumper'
+    static_configs:
+      - targets: ['localhost:8001']
+```
+
+Readiness checklist
+- Dumper metrics increment, errors=0
+- Files exist in ./data/parquet/date=.../hour=..., sidecar JSON matches
+- pytest -q passes
+- signal_engine uses same features as offline (features/core.py)
+- Under 5–10k msg/s no leaks, flush p95 ≤ 2000 ms
+- redis_stream_lag stable, no mass retries/dlq
 - Wrapper RedisStream provides xadd (with idempotency key), read_group (auto group create), and ack
 
 Offline training & model export

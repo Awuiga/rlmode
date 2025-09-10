@@ -70,6 +70,7 @@ def main():
         "metrics:ai",
         "metrics:executor",
         "metrics:risk",
+        "metrics:parquet",
         "control:events",
     ]
 
@@ -107,4 +108,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -103,72 +103,103 @@ async def binance_stream(rs: RedisStream, symbols: List[str], depth_levels: int,
             backoff = backoff[1:] + [backoff[-1]]
 
 
-async def bybit_stream(rs: RedisStream, symbols: List[str], depth_levels: int, url_base: str):
-    # Single connection; subscribe to topics per symbol
+async def bybit_stream(rs: RedisStream, symbols: List[str], depth_levels: int, url_base: str, category: str):
+    # Build primary and AWS fallback URLs as path-based category endpoints
+    cat = (category or "linear").strip().lower()
+    base = url_base.rstrip("/")
+    primary_url = f"{base}/{cat}"
+    aws_url = primary_url.replace("stream.bybit.com", "stream.bybit-aws.com")
+
+    # Subscribe to standard Bybit v5 public topics
     args = []
     for s in symbols:
-        args.append(f"orderbook.50.{s}")
         args.append(f"publicTrade.{s}")
+        args.append(f"orderbook.1.{s}")
+        args.append(f"tickers.{s}")
     sub = json.dumps({"op": "subscribe", "args": args})
+
     last_trade: Dict[str, LastTrade] = {}
     orderbook: Dict[str, Dict[str, List[List[str]]]] = {}
     backoff = [0.5, 1.0, 2.0, 5.0]
+
     while True:
-        try:
-            async with websockets.connect(url_base, ping_interval=20, ping_timeout=10) as ws:
-                log.info("bybit_ws_connected", url=url_base)
-                await ws.send(sub)
-                while True:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=60)
-                    msg = json.loads(raw)
-                    topic = msg.get("topic") or ""
-                    if not topic:
-                        continue
-                    if topic.startswith("publicTrade"):
-                        data = msg.get("data", [])
-                        for t in data:
-                            sym = t.get("s") or t.get("symbol") or ""
-                            if not sym:
-                                continue
-                            price = float(t.get("p"))
-                            qty = float(t.get("v") or t.get("q", 0.0))
-                            side = "buy" if (t.get("S") or t.get("side")) == "Buy" else "sell"
-                            last_trade[sym] = LastTrade(price=price, qty=qty, side=side)
-                        continue
-                    if topic.startswith("orderbook"):
-                        sym = topic.split(".")[-1]
-                        typ = msg.get("type")
-                        data = msg.get("data") or {}
-                        if typ == "snapshot":
-                            orderbook[sym] = {"b": data.get("b", []), "a": data.get("a", [])}
-                        elif typ == "delta":
-                            book = orderbook.setdefault(sym, {"b": [], "a": []})
-                            # Apply deltas (simplified): just replace for safety
-                            if "b" in data:
-                                book["b"] = data["b"] + book.get("b", [])
-                            if "a" in data:
-                                book["a"] = data["a"] + book.get("a", [])
-                        book = orderbook.get(sym) or {}
-                        bids_raw = book.get("b", [])[:depth_levels]
-                        asks_raw = book.get("a", [])[:depth_levels]
-                        if not bids_raw or not asks_raw:
+        # Try primary, then AWS fallback within the same iteration
+        for url in (primary_url, aws_url):
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+                    log.info("bybit_ws_connected", url=url, symbols=symbols)
+                    await ws.send(sub)
+                    while True:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=60)
+                        msg = json.loads(raw)
+                        topic = msg.get("topic") or ""
+                        if not topic:
                             continue
-                        bids = [(float(p), float(q)) for p, q in bids_raw]
-                        asks = [(float(p), float(q)) for p, q in asks_raw]
-                        bid1 = float(bids[0][0])
-                        ask1 = float(asks[0][0])
-                        evt = MarketEvent(
-                            ts=int(msg.get("ts") or utc_ms()),
-                            symbol=sym,
-                            bid1=bid1,
-                            ask1=ask1,
-                            bids=bids,
-                            asks=asks,
-                            last_trade=last_trade.get(sym),
-                        )
-                        rs.xadd("md:raw", evt)
-        except Exception as e:
-            log.error("bybit_ws_error", error=str(e))
+                        if topic.startswith("publicTrade"):
+                            data = msg.get("data", [])
+                            for t in data:
+                                sym = t.get("s") or t.get("symbol") or ""
+                                if not sym:
+                                    continue
+                                price = float(t.get("p"))
+                                qty = float(t.get("v") or t.get("q", 0.0))
+                                side = "buy" if (t.get("S") or t.get("side")) == "Buy" else "sell"
+                                last_trade[sym] = LastTrade(price=price, qty=qty, side=side)
+                            continue
+                        if topic.startswith("tickers"):
+                            data = (msg.get("data") or [{}])[0] if isinstance(msg.get("data"), list) else (msg.get("data") or {})
+                            sym = data.get("symbol") or data.get("s")
+                            if sym:
+                                # Derive side from tickDirection when available
+                                dirv = data.get("tickDirection") or data.get("td") or ""
+                                side = "buy" if "Plus" in str(dirv) else ("sell" if dirv else None)
+                                try:
+                                    px = float(data.get("lastPrice") or data.get("lp"))
+                                except Exception:
+                                    px = None
+                                if px is not None and side is not None:
+                                    last_trade[sym] = LastTrade(price=px, qty=0.0, side=side)  # qty unknown from ticker
+                            continue
+                        if topic.startswith("orderbook"):
+                            sym = topic.split(".")[-1]
+                            typ = msg.get("type")
+                            data = msg.get("data") or {}
+                            if typ == "snapshot":
+                                orderbook[sym] = {"b": data.get("b", []), "a": data.get("a", [])}
+                            elif typ == "delta":
+                                book = orderbook.setdefault(sym, {"b": [], "a": []})
+                                # Apply deltas (simplified): prepend new levels
+                                if "b" in data:
+                                    book["b"] = data["b"] + book.get("b", [])
+                                if "a" in data:
+                                    book["a"] = data["a"] + book.get("a", [])
+                            book = orderbook.get(sym) or {}
+                            bids_raw = book.get("b", [])[:depth_levels]
+                            asks_raw = book.get("a", [])[:depth_levels]
+                            if not bids_raw or not asks_raw:
+                                continue
+                            bids = [(float(p), float(q)) for p, q in bids_raw]
+                            asks = [(float(p), float(q)) for p, q in asks_raw]
+                            bid1 = float(bids[0][0])
+                            ask1 = float(asks[0][0])
+                            evt = MarketEvent(
+                                ts=int(msg.get("ts") or utc_ms()),
+                                symbol=sym,
+                                bid1=bid1,
+                                ask1=ask1,
+                                bids=bids,
+                                asks=asks,
+                                last_trade=last_trade.get(sym),
+                            )
+                            rs.xadd("md:raw", evt)
+            except Exception as e:
+                log.error("bybit_ws_error", error=str(e), url=url)
+                # Try next URL in sequence (fallback) or backoff if both failed
+                continue
+            # If we exit the with-context without exception, break retry loop
+            break
+        else:
+            # Both endpoints failed
             await asyncio.sleep(backoff[0])
             backoff = backoff[1:] + [backoff[-1]]
 
@@ -207,7 +238,17 @@ def main():
             if cfg.market.use == "binance_futs":
                 tasks.append(asyncio.create_task(binance_stream(rs, cfg.symbols, depth_levels, cfg.market.binance_ws_public)))
             elif cfg.market.use == "bybit_v5":
-                tasks.append(asyncio.create_task(bybit_stream(rs, cfg.symbols, depth_levels, cfg.market.bybit_ws_public)))
+                tasks.append(
+                    asyncio.create_task(
+                        bybit_stream(
+                            rs,
+                            cfg.symbols,
+                            depth_levels,
+                            cfg.market.bybit_ws_public,
+                            getattr(cfg.market, "category", "linear"),
+                        )
+                    )
+                )
             else:
                 log.error("unsupported_market", market=cfg.market.use)
                 return

@@ -123,6 +123,8 @@ class AppConfig(BaseModel):
         symbols: List[str] = Field(default_factory=list)
         binance_ws_public: str = Field(default="wss://fstream.binance.com/stream")
         bybit_ws_public: str = Field(default="wss://stream.bybit.com/v5/public")
+        # Bybit v5 category: linear | spot | inverse
+        category: str = Field(default="linear")
 
     class SimulatorCurve(BaseModel):
         x: List[float] = Field(default_factory=lambda: [10000, 50000, 200000, 1000000])
