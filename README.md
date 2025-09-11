@@ -43,6 +43,35 @@ Quick start
 5) Prometheus metrics (monitor service)
    http://localhost:8000/metrics
 
+Bybit v5 SPOT quick start
+
+```yaml
+market:
+  use: bybit_v5
+  category: spot
+  symbols: [BTCUSDT]
+  bybit_ws_public: wss://stream.bybit.com/v5/public
+```
+
+Run services:
+
+```
+docker compose build --no-cache collector
+docker compose up -d redis collector parquet-dumper monitor
+docker compose logs -f collector
+```
+
+Expected log on connect:
+
+{"event":"bybit_ws_connected","url":"wss://stream.bybit.com/v5/public/spot", ...}
+
+Check parquet:
+
+```
+docker compose logs -f parquet-dumper
+ls -R ./data/parquet | head
+```
+
 Dry run (no exchange)
 - Default config uses `exchange: fake` and produces synthetic market data.
 - To run a quick local dry-run test without Docker:

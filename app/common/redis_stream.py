@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Mapping
 
+import json
+
 import redis
 
 try:
@@ -43,37 +45,48 @@ class RedisStream:
     def ensure_group(self, stream: str, group: str) -> None:
         self._ensure_group(stream, group)
 
-    def xadd(self, stream: str, data: Any, idempotency_key: Optional[str] = None) -> Optional[str]:
-        # Accept Pydantic models, dataclasses, or plain dict-like payloads
+    def xadd(
+        self,
+        stream: str,
+        data: Any,
+        idempotency_key: Optional[str] = None,
+        *,
+        maxlen: int | None = None,
+    ) -> Optional[str]:
+        # Normalize input into a plain dict, drop None, JSON-serialize complex values
         payload: Dict[str, Any]
         if isinstance(data, BaseModel):
-            # Pydantic v2: prefer model_dump; fall back gracefully
             try:
-                payload = data.model_dump(mode="json")  # type: ignore[call-arg]
+                payload = data.model_dump(mode="json")  # pydantic v2 preferred
             except TypeError:
-                # Some environments may not support the 'mode' arg
-                payload = data.model_dump()  # type: ignore[call-arg]
+                payload = data.model_dump()
         elif hasattr(data, "dict") and callable(getattr(data, "dict")):
-            # Pydantic v1 or objects exposing .dict()
-            payload = dict(data.dict())  # type: ignore[attr-defined]
+            payload = dict(data.dict())  # pydantic v1 or similar
         elif is_dataclass(data):
             payload = asdict(data)
         elif isinstance(data, Mapping):
             payload = dict(data)
         else:
             raise TypeError(f"xadd unsupported payload type: {type(data)!r}")
-        idem_id: Optional[str] = None
+
+        cleaned: Dict[str, Any] = {}
+        for k, v in payload.items():
+            if v is None:
+                continue
+            if isinstance(v, (str, int, float, bytes)):
+                cleaned[k] = v
+            else:
+                cleaned[k] = json.dumps(v, separators=(",", ":"))
+
         if idempotency_key:
             key = f"idem:{stream}:{idempotency_key}"
             # Avoid duplicates within 24h
-            if self.client.set(name=key, value="1", nx=True, ex=86400):
-                pass
-            else:
+            if not self.client.set(name=key, value="1", nx=True, ex=86400):
                 # Duplicate, ignore
                 log.info("xadd_skip_duplicate", stream=stream, idem=key)
                 return None
-        msg_id = self.client.xadd(stream, payload)
-        return msg_id
+
+        return self.client.xadd(stream, cleaned, maxlen=maxlen)
 
     def read_group(
         self,

@@ -3,6 +3,7 @@
 exchange_mode: live_paper  # live_paper | live_real
 market:
   use: bybit_v5   # binance_futs | bybit_v5 | fake
+  category: spot            # linear | spot | inverse (Bybit v5 WS category)
   symbols: [BTCUSDT]
   binance_ws_public: wss://fstream.binance.com/stream
   bybit_ws_public:   wss://stream.bybit.com/v5/public
