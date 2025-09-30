@@ -1,0 +1,29 @@
+{
+  "title": "RLMode Trading",
+  "schemaVersion": 37,
+  "version": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Rolling Precision",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rolling_precision",
+          "legendFormat": "precision"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "ONNX Parity Failures (5m)",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "increase(onnx_parity_fail_total[5m])",
+          "legendFormat": "fails"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+enable: true
+precision:
+  window: 50
+  min_precision: 0.55
+  safety_precision: 0.5
+  freeze_step: 0.02
+  consecutive_windows: 2
+markout:
+  window: 30
+  min_markout: 0.0
+volatility:
+  enabled: true
+  max_consecutive: 3
+  precision_floor: 0.5
+  debounce_ms: 60000
+trade_cluster:
+  enabled: false
+  window_ms: 60000
+  max_trades: 3
+  cumulative_loss: -0.0005

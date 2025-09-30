@@ -1,0 +1,19 @@
+groups:
+  - name: trading-health
+    rules:
+      - alert: WinRateDrop
+        expr: rolling_precision < 0.5
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Rolling precision below 50%
+          description: Rolling precision has stayed under 0.5 for more than 10 minutes.
+      - alert: OnnxParityFailure
+        expr: increase(onnx_parity_fail_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: ONNX parity failures detected
+          description: Training or inference emitted onnx_parity_fail_total > 0 within the last 5 minutes.
