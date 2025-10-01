@@ -9,11 +9,83 @@ groups:
         annotations:
           summary: Rolling precision below 50%
           description: Rolling precision has stayed under 0.5 for more than 10 minutes.
+      - alert: CanaryWinrateDrop
+        expr: increase(trades_won_total{route="canary"}[30m]) / increase(trades_opened_total{route="canary"}[30m]) < (winrate_baseline_active - 0.05)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Canary winrate dropped versus baseline
+          description: Canary winrate fell more than 5 percentage points below the active baseline.
       - alert: OnnxParityFailure
-        expr: increase(onnx_parity_fail_total[5m]) > 0
+        expr: increase(onnx_parity_fail_total[10m]) > 0
         for: 0m
         labels:
           severity: warning
         annotations:
           summary: ONNX parity failures detected
-          description: Training or inference emitted onnx_parity_fail_total > 0 within the last 5 minutes.
+          description: Training or inference emitted onnx_parity_fail_total > 0 within the last 10 minutes.
+      - alert: DriftDetected
+        expr: max_over_time(psi_feature{feature!=""}[30m]) > 0.30 or max_over_time(ks_feature{feature!=""}[30m]) > 0.20
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: Feature drift detected
+          description: PSI or KS drift metrics breached their configured guard rails within the last 30 minutes.
+      - alert: CalibrationOutOfSpec
+        expr: ece_online{split="online"} > 0.05 or brier_online{split="online"} > brier_baseline_active{split="online"}
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Calibration quality degraded
+          description: Online calibration ECE exceeded 5% or Brier score regressed versus the active baseline.
+      - alert: ThroughputSpike
+        expr: trades_per_hour > trades_per_hour_prev_release_p95 * 1.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Trade throughput spike
+          description: Trades per hour exceeded 150% of the previous release p95 baseline.
+      - alert: ExecutionDegradation
+        expr: fill_rate_rolling < 0.25 and increase(exec_ladder_aggressiveness_total{bucket="high"}[10m]) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Execution ladder aggressiveness degrading
+          description: Fill rate dropped below 25% while high-aggression ladder usage is increasing, indicating execution issues.
+      - alert: FailSafeActive
+        expr: increase(fail_safe_switch_total[1m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Fail-safe engaged
+          description: The executor switched to paper trading due to a critical alert; investigate root cause before resuming real execution.
+      - alert: BackpressureActive
+        expr: increase(backpressure_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Signal backpressure throttling
+          description: Backpressure is throttling candidate emission; inspect Redis queue depth and downstream latency.
+      - alert: ParquetGapDetected
+        expr: increase(parquet_gap_detected_ms[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Parquet dataset gap detected
+          description: The backfill scanner reported a parquet gap exceeding the configured threshold; backfill before re-enabling live trading.
+      - alert: ExchangeReferenceMismatch
+        expr: increase(exchange_reference_mismatch_total[30m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Exchange reference mismatch
+          description: Live venue settings differ from config/symbols.yml; confirm tick sizes, min quantities, and fees before resuming execution.

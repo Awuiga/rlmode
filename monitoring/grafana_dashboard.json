@@ -1,28 +1,203 @@
 {
   "title": "RLMode Trading",
   "schemaVersion": 37,
-  "version": 1,
+  "version": 2,
   "panels": [
     {
       "type": "timeseries",
-      "title": "Rolling Precision",
+      "title": "Win Rate by Route",
       "datasource": "Prometheus",
-      "targets": [
-        {
-          "expr": "rolling_precision",
-          "legendFormat": "precision"
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": 0.0},
+              {"color": "yellow", "value": 0.5},
+              {"color": "green", "value": 0.6}
+            ]
+          }
         }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"}
+      },
+      "targets": [
+        {"expr": "winrate_rolling{route=\"canary\"}", "legendFormat": "Canary"},
+        {"expr": "winrate_rolling{route=\"paper\"}", "legendFormat": "Paper"},
+        {"expr": "winrate_rolling{route=\"full\"}", "legendFormat": "Full"},
+        {"expr": "winrate_baseline_active", "legendFormat": "Baseline"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Markout & Fill Rate",
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": -0.01},
+              {"color": "yellow", "value": 0.0},
+              {"color": "green", "value": 0.25}
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"}
+      },
+      "targets": [
+        {"expr": "avg_markout_1000ms{route=\"canary\"}", "legendFormat": "Markout 1000ms · Canary"},
+        {"expr": "avg_markout_1000ms{route=\"paper\"}", "legendFormat": "Markout 1000ms · Paper"},
+        {"expr": "avg_markout_1000ms{route=\"full\"}", "legendFormat": "Markout 1000ms · Full"},
+        {"expr": "fill_rate_rolling{route=\"canary\"}", "legendFormat": "Fill rate · Canary"},
+        {"expr": "fill_rate_rolling{route=\"paper\"}", "legendFormat": "Fill rate · Paper"},
+        {"expr": "fill_rate_rolling{route=\"full\"}", "legendFormat": "Fill rate · Full"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Score Distribution (Online)",
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": 0.0},
+              {"color": "yellow", "value": 0.5},
+              {"color": "green", "value": 0.6}
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"}
+      },
+      "targets": [
+        {"expr": "model_score_distribution{stat=\"mean\",split=\"online\"}", "legendFormat": "Active mean"},
+        {"expr": "shadow_score_distribution{split=\"online\"}", "legendFormat": "Shadow mean"},
+        {"expr": "model_score_distribution{stat=\"std\",split=\"online\"}", "legendFormat": "Active std"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Calibration",
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": 0.0},
+              {"color": "yellow", "value": 0.05},
+              {"color": "red", "value": 0.1}
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"}
+      },
+      "targets": [
+        {"expr": "brier_online{split=\"online\"}", "legendFormat": "Brier"},
+        {"expr": "brier_baseline_active{split=\"online\"}", "legendFormat": "Brier baseline"},
+        {"expr": "ece_online{split=\"online\"}", "legendFormat": "ECE"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Drift PSI / KS",
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": 0.0},
+              {"color": "yellow", "value": 0.2},
+              {"color": "red", "value": 0.3}
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "KS - .*"},
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {"color": "green", "value": 0.0},
+                    {"color": "yellow", "value": 0.1},
+                    {"color": "red", "value": 0.2}
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"}
+      },
+      "targets": [
+        {"expr": "psi_feature{feature!=\"\"}", "legendFormat": "PSI - {{feature}}"},
+        {"expr": "ks_feature{feature!=\"\"}", "legendFormat": "KS - {{feature}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Execution Ladder Aggressiveness",
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"}
+      },
+      "targets": [
+        {"expr": "rate(exec_ladder_aggressiveness_total{bucket=\"low\"}[5m])", "legendFormat": "Low"},
+        {"expr": "rate(exec_ladder_aggressiveness_total{bucket=\"medium\"}[5m])", "legendFormat": "Medium"},
+        {"expr": "rate(exec_ladder_aggressiveness_total{bucket=\"high\"}[5m])", "legendFormat": "High"}
       ]
     },
     {
       "type": "stat",
-      "title": "ONNX Parity Failures (5m)",
+      "title": "Parity & Schema",
       "datasource": "Prometheus",
+      "options": {
+        "reduceOptions": {"calcs": ["last"], "fields": "", "values": false},
+        "orientation": "horizontal",
+        "textMode": "value_and_name"
+      },
       "targets": [
-        {
-          "expr": "increase(onnx_parity_fail_total[5m])",
-          "legendFormat": "fails"
+        {"expr": "increase(onnx_parity_fail_total[5m])", "legendFormat": "ONNX parity (5m)"},
+        {"expr": "increase(parquet_schema_version_mismatch_total[5m])", "legendFormat": "Parquet schema (5m)"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Rollouts & Mode Switches",
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
         }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom"}
+      },
+      "targets": [
+        {"expr": "increase(mode_switch_total[30m])", "legendFormat": "Mode switches (30m)"},
+        {"expr": "increase(rollback_total[30m])", "legendFormat": "Rollbacks (30m)"}
       ]
     }
   ]

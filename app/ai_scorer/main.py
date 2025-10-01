@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -61,6 +62,51 @@ def _get_feature_order(state: Any) -> List[str]:
                 order = list(order)
         return list(order)
     return []
+
+
+def _sanitize_metric_suffix(raw: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", (raw or "").strip().lower())
+    cleaned = cleaned.strip("_")
+    return cleaned or "unknown"
+
+
+def _resolve_brier_baseline(metadata: Dict[str, Any] | None, cfg) -> float:
+    candidate: Optional[float] = None
+    if isinstance(metadata, dict):
+        cal_meta = metadata.get("calibration")
+        if isinstance(cal_meta, dict):
+            for key in ("brier_baseline", "brier_valid", "brier"):
+                if key in cal_meta:
+                    try:
+                        candidate = float(cal_meta[key])
+                    except (TypeError, ValueError):
+                        candidate = None
+                    if candidate is not None:
+                        break
+        if candidate is None:
+            metrics_meta = metadata.get("metrics")
+            if isinstance(metrics_meta, dict):
+                for key in ("brier_validation", "brier_valid", "brier"):
+                    if key in metrics_meta:
+                        try:
+                            candidate = float(metrics_meta[key])
+                        except (TypeError, ValueError):
+                            candidate = None
+                        if candidate is not None:
+                            break
+    if candidate is None:
+        baseline_attr = getattr(cfg, "brier_baseline", None)
+        if baseline_attr is not None:
+            try:
+                candidate = float(baseline_attr)
+            except (TypeError, ValueError):
+                candidate = None
+    if candidate is None:
+        try:
+            candidate = float(getattr(cfg, "brier_alert", 0.2))
+        except (TypeError, ValueError):
+            candidate = 0.2
+    return float(candidate)
 
 
 def _parity_self_test(handle: "ModelHandle", feature_count: int) -> bool:
@@ -155,6 +201,15 @@ class DecisionRecord:
     ts_ms: int
     shadow_score: Optional[float] = None
     pnl: Optional[float] = None
+
+
+@dataclass
+class BatchCandidate:
+    candidate: Candidate
+    features: Dict[str, float]
+    decision_id: str
+    default_score: float
+    enqueued_ms: int
 
 
 @dataclass
@@ -282,9 +337,13 @@ class DriftMonitor:
         if not monitor.ready():
             return []
         psi, ks = monitor.compute()
+        suffix = _sanitize_metric_suffix(labels.get("feature", ""))
+        base_labels = dict(labels)
         metrics = [
-            ("feature_psi", psi, labels),
-            ("feature_ks", ks, labels),
+            (f"psi_feature_{suffix}", psi, base_labels),
+            (f"ks_feature_{suffix}", ks, base_labels),
+            ("psi_feature", psi, base_labels),
+            ("ks_feature", ks, base_labels),
         ]
         if psi > monitor.psi_alert:
             alert_labels = dict(labels)
@@ -335,9 +394,10 @@ class CalibrationMonitor:
             mean_conf = float(bucket_probs.mean())
             mean_outcome = float(bucket_outcomes.mean())
             ece += (count / total) * abs(mean_outcome - mean_conf)
+        labels = {"split": "online"}
         metrics = [
-            ("calibration_brier_score", brier, {}),
-            ("calibration_expected_calibration_error", float(ece), {}),
+            ("brier_online", brier, labels),
+            ("ece_online", float(ece), labels),
         ]
         if brier > self.brier_alert:
             metrics.append(("drift_alert_total", 1.0, {"kind": "brier"}))
@@ -567,30 +627,38 @@ def try_load_onnx(path: str) -> Tuple[Optional[object], Optional[str], Optional[
         return None, None, None
 
 
-def extract_probability(outputs: List[np.ndarray], prob_idx: int) -> float:
+def extract_probabilities(outputs: List[np.ndarray], prob_idx: int) -> List[float]:
     if not outputs:
-        return 0.0
+        return []
     prob_tensor = outputs[prob_idx]
     if isinstance(prob_tensor, np.ndarray):
         if prob_tensor.ndim == 2:
             if prob_tensor.shape[1] == 1:
-                return float(prob_tensor[0, 0])
+                return [float(x) for x in prob_tensor[:, 0]]
             if prob_tensor.shape[1] >= 2:
-                return float(prob_tensor[0, -1])
+                return [float(x) for x in prob_tensor[:, -1]]
         if prob_tensor.ndim == 1:
-            return float(prob_tensor[-1])
+            return [float(x) for x in prob_tensor]
     for out in outputs:
         if isinstance(out, dict):
+            values = []
             for key, value in out.items():
                 try:
                     klass = str(key)
                     if klass.endswith("1") or klass in {"1", "positive", "True"}:
-                        return float(value)
+                        values.append(float(value))
                 except Exception:
                     continue
+            if values:
+                return values
         if isinstance(out, np.ndarray) and out.size:
-            return float(out.flat[-1])
-    return 0.0
+            return [float(out.flat[-1])]
+    return []
+
+
+def extract_probability(outputs: List[np.ndarray], prob_idx: int) -> float:
+    probs = extract_probabilities(outputs, prob_idx)
+    return probs[0] if probs else 0.0
 
 
 def build_feature_vector(cand: Candidate, feature_names: List[str]) -> np.ndarray:
@@ -598,7 +666,7 @@ def build_feature_vector(cand: Candidate, feature_names: List[str]) -> np.ndarra
     feats = cand.features or {}
     for idx, name in enumerate(feature_names):
         vec[idx] = float(feats.get(name, 0.0))
-    return vec.reshape(1, -1)
+    return vec
 
 
 def _validate_feature_schema(metadata: Dict[str, Any] | None, state: FeatureState, feature_names: List[str]) -> None:
@@ -623,7 +691,11 @@ class AIScorerService:
     def __init__(self) -> None:
         setup_logging()
         self.cfg = load_app_config()
-        self.rs = RedisStream(self.cfg.redis.url, default_maxlen=self.cfg.redis.streams_maxlen)
+        self.rs = RedisStream(
+            self.cfg.redis.url,
+            default_maxlen=self.cfg.redis.streams_maxlen,
+            pending_retry=self.cfg.redis.pending_retry,
+        )
         feature_state = FeatureState.from_config(self.cfg.signal_engine.features)
         default_thresholds = {
             "tau_entry": float(self.cfg.ai_scorer.thresholds.entry),
@@ -641,12 +713,20 @@ class AIScorerService:
         if not self.feature_names:
             self.feature_names = _get_feature_order(feature_state)
         self.pending: Dict[str, Deque[DecisionRecord]] = defaultdict(deque)
+        self.batch_cfg = self.cfg.ai_scorer.batch_inference
+        self._batch_queue: Deque[BatchCandidate] = deque()
+        self._batch_first_enqueued_ms: Optional[int] = None
         self.recent_scores = RunningStats()
         self.score_metric_interval = 50
         self.score_metric_counter = 0
         monitoring_meta = (self.metadata or {}).get("monitoring")
         self.drift_monitor = DriftMonitor(self.cfg.ai_scorer.drift, monitoring_meta)
         drift_cfg = self.cfg.ai_scorer.drift
+        self.brier_baseline = _resolve_brier_baseline(self.metadata, drift_cfg)
+        self.rs.xadd(
+            "metrics:ai",
+            Metric(name="brier_baseline_active", value=float(self.brier_baseline), labels={"split": "online"}),
+        )
         if drift_cfg and getattr(drift_cfg, "enabled", False):
             bins = (monitoring_meta or {}).get("score", {}).get("bins") or drift_cfg.score_bins or [i / 10 for i in range(11)]
             self.calibration_monitor = CalibrationMonitor(bins, drift_cfg.window, drift_cfg.brier_alert, drift_cfg.ece_alert)
@@ -789,39 +869,55 @@ class AIScorerService:
         processed = 0
         while True:
             self._maybe_restore_model()
-            msgs = self.rs.read_group(group=group, consumer=consumer, streams=streams, block_ms=1000, count=self.cfg.ai_scorer.batch_size)
+            msgs = self.rs.read_group(
+                group=group,
+                consumer=consumer,
+                streams=streams,
+                block_ms=1000,
+                count=self.cfg.ai_scorer.batch_size,
+            )
             if not msgs:
+                self._maybe_flush_batch(force=True)
                 self.adaptive.maybe_adjust()
                 continue
             for stream, items in msgs:
                 for msg_id, data in items:
+                    success = False
                     try:
                         if stream == "md:raw" and self.window_buffer is not None:
                             from ..common.schema import MarketEvent
 
                             ev = MarketEvent.model_validate(data)
                             self.window_buffer.push(ev)
+                            success = True
                             continue
                         if stream == "exec:fills":
                             fill = Fill.model_validate(data)
                             self._handle_fill(fill)
+                            success = True
                         elif stream == "metrics:risk":
                             metric = Metric.model_validate(data)
                             self._handle_risk_metric(metric)
+                            success = True
                         elif stream == "control:events":
                             evt = ControlEvent.model_validate(data)
                             self._handle_control_event(evt)
+                            success = True
                         else:
                             cand = Candidate.model_validate(data)
                             self._score_candidate(cand)
                             processed += 1
+                            success = True
                     except Exception as exc:
                         log.error("ai_scorer_error", stream=stream, error=str(exc))
                     finally:
-                        self.rs.ack(stream, group, msg_id)
+                        if success:
+                            self.rs.ack(stream, group, msg_id)
                     if max_iters_env and processed >= max_iters_env:
+                        self._maybe_flush_batch(force=True)
                         log.info("ai_scorer_exit_dry_run", processed=processed)
                         return
+            self._maybe_flush_batch()
             self.adaptive.maybe_adjust()
 
     def _handle_risk_metric(self, metric: Metric) -> None:
@@ -843,6 +939,13 @@ class AIScorerService:
         elif evt.type.upper() == "MODEL_ACTIVE":
             if "active" in self.models:
                 self._activate_model("active", reason=evt.reason or "manual_active")
+
+    def _emit_metrics(self, metrics: List[tuple[str, float, Dict[str, str]]]) -> None:
+        for name, value, labels in metrics:
+            self.rs.xadd(
+                "metrics:ai",
+                Metric(name=name, value=float(value), labels=dict(labels) if labels else None),
+            )
 
     def _apply_spread_entry(self, base_entry: float, feats: Dict[str, float]) -> float:
         cfg = self.cfg.ai_scorer.spread_adaptive
@@ -874,10 +977,90 @@ class AIScorerService:
             scene_id = f"{cand.symbol}-{int(feats.get('spread_regime', 0))}-{int(feats.get('volatility_regime', 0))}"
             feats["scene_id"] = scene_id
         self.rs.xadd("metrics:ai", Metric(name="signals_evaluated_total", value=1.0, labels={"symbol": cand.symbol}))
-        active_handle = self.models[self.active_model_name]
-        vector_active = build_feature_vector(cand, active_handle.feature_names)
+        enqueued_ms = utc_ms()
         default_score = float(cand.score)
-        p_raw = self._predict(active_handle, vector_active, default_score)
+        batch_item = BatchCandidate(
+            candidate=cand,
+            features=feats,
+            decision_id=decision_id,
+            default_score=default_score,
+            enqueued_ms=enqueued_ms,
+        )
+        self._batch_queue.append(batch_item)
+        if self._batch_first_enqueued_ms is None:
+            self._batch_first_enqueued_ms = enqueued_ms
+        self._maybe_flush_batch()
+
+    def _maybe_flush_batch(self, force: bool = False) -> None:
+        if not self._batch_queue:
+            return
+        if not getattr(self.batch_cfg, "enabled", True):
+            self._flush_candidate_batch()
+            return
+        if force:
+            self._flush_candidate_batch()
+            return
+        max_batch = max(int(getattr(self.batch_cfg, "max_batch", 1) or 1), 1)
+        interval_ms = max(int(getattr(self.batch_cfg, "flush_interval_ms", 20) or 1), 1)
+        if len(self._batch_queue) >= max_batch:
+            self._flush_candidate_batch()
+            return
+        if self._batch_first_enqueued_ms is None:
+            self._batch_first_enqueued_ms = utc_ms()
+            return
+        now_ms = utc_ms()
+        if now_ms - self._batch_first_enqueued_ms >= interval_ms:
+            self._flush_candidate_batch()
+
+    def _flush_candidate_batch(self) -> None:
+        if not self._batch_queue:
+            return
+        items = list(self._batch_queue)
+        self._batch_queue.clear()
+        self._batch_first_enqueued_ms = None
+        active_handle = self.models[self.active_model_name]
+        active_vectors = np.stack(
+            [build_feature_vector(item.candidate, active_handle.feature_names) for item in items],
+            axis=0,
+        ).astype(np.float32)
+        defaults = [item.default_score for item in items]
+        active_probs = self._predict_batch(active_handle, active_vectors, defaults)
+        if self.shadow_handle is not None:
+            shadow_vectors = np.stack(
+                [build_feature_vector(item.candidate, self.shadow_handle.feature_names) for item in items],
+                axis=0,
+            ).astype(np.float32)
+            shadow_probs = self._predict_batch(self.shadow_handle, shadow_vectors, defaults)
+        else:
+            shadow_probs = [None] * len(items)
+        for idx, item in enumerate(items):
+            shadow_raw = shadow_probs[idx] if idx < len(shadow_probs) else None
+            self._finalize_candidate(active_handle, item, active_probs[idx], shadow_raw)
+
+    def _predict_batch(self, handle: ModelHandle, vectors: np.ndarray, defaults: List[float]) -> List[float]:
+        if handle.session is None or handle.input_name is None:
+            return list(defaults)
+        if vectors.ndim == 1:
+            vectors = vectors.reshape(1, -1)
+        try:
+            outputs = handle.session.run(None, {handle.input_name: vectors})
+            probs = extract_probabilities(outputs, handle.prob_idx or 0)
+            if len(probs) != len(defaults):
+                return list(defaults)
+            return [float(p) for p in probs]
+        except Exception as exc:  # pragma: no cover - onnx runtime failure
+            log.warning("onnx_inference_failed", model=handle.model_id, error=str(exc))
+            return list(defaults)
+
+    def _finalize_candidate(
+        self,
+        active_handle: ModelHandle,
+        item: BatchCandidate,
+        p_raw: float,
+        shadow_raw: Optional[float],
+    ) -> None:
+        cand = item.candidate
+        feats = item.features
         p_cal = active_handle.calibrator.apply(p_raw)
         self.recent_scores.update(p_cal)
         self.score_metric_counter += 1
@@ -888,11 +1071,8 @@ class AIScorerService:
         if drift_metrics:
             self._emit_metrics(drift_metrics)
         shadow_cal: Optional[float] = None
-        if self.shadow_handle is not None:
-            shadow_handle = self.shadow_handle
-            shadow_vector = build_feature_vector(cand, shadow_handle.feature_names)
-            shadow_raw = self._predict(shadow_handle, shadow_vector, default_score)
-            shadow_cal = shadow_handle.calibrator.apply(shadow_raw)
+        if self.shadow_handle is not None and shadow_raw is not None:
+            shadow_cal = self.shadow_handle.calibrator.apply(shadow_raw)
             feats["shadow_p_calibrated"] = float(shadow_cal)
             self.rs.xadd(
                 "metrics:ai",
@@ -902,7 +1082,7 @@ class AIScorerService:
                 "metrics:ai",
                 Metric(name="shadow_score_distribution", value=float(shadow_cal), labels={"split": "online"}),
             )
-            shadow_tau_entry = self._apply_spread_entry(shadow_handle.thresholds.get("tau_entry", 0.0), feats)
+            shadow_tau_entry = self._apply_spread_entry(self.shadow_handle.thresholds.get("tau_entry", 0.0), feats)
             if shadow_cal >= shadow_tau_entry:
                 self.rs.xadd(
                     "metrics:ai",
@@ -910,13 +1090,15 @@ class AIScorerService:
                 )
         base_tau_entry = self.cfg.ai_scorer.thresholds.entry
         dynamic_tau_entry = self._apply_spread_entry(base_tau_entry, feats)
-        feats.update({
-            "p_raw": float(p_raw),
-            "p_calibrated": float(p_cal),
-            "tau_entry_base": float(base_tau_entry),
-            "tau_entry": float(dynamic_tau_entry),
-            "tau_hold": float(self.cfg.ai_scorer.thresholds.hold),
-        })
+        feats.update(
+            {
+                "p_raw": float(p_raw),
+                "p_calibrated": float(p_cal),
+                "tau_entry_base": float(base_tau_entry),
+                "tau_entry": float(dynamic_tau_entry),
+                "tau_hold": float(self.cfg.ai_scorer.thresholds.hold),
+            }
+        )
         adjustment = dynamic_tau_entry - base_tau_entry
         if abs(adjustment) > 1e-6:
             feats["tau_entry_adjustment"] = float(adjustment)
@@ -926,7 +1108,7 @@ class AIScorerService:
             )
         if p_cal >= dynamic_tau_entry:
             record = DecisionRecord(
-                decision_id=decision_id,
+                decision_id=item.decision_id,
                 symbol=cand.symbol,
                 score=float(p_cal),
                 ts_ms=utc_ms(),
@@ -934,8 +1116,10 @@ class AIScorerService:
             )
             self.pending[cand.symbol].append(record)
             appr = ApprovedSignal(**cand.model_dump(), p_success=float(p_cal))
-            self.rs.xadd("sig:approved", appr)
-            self.rs.xadd("metrics:ai", Metric(name="signals_approved_total", value=1.0, labels={"symbol": cand.symbol}))
+            self.rs.xadd("sig:approved", appr, idempotency_key=item.decision_id)
+            self.rs.xadd(
+                "metrics:ai", Metric(name="signals_approved_total", value=1.0, labels={"symbol": cand.symbol})
+            )
 
     def _handle_fill(self, fill: Fill) -> None:
         queue = self.pending.get(fill.symbol)
