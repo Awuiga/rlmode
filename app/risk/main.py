@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from collections import deque, defaultdict
+from collections import deque, defaultdict, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Deque, Dict, Optional, Tuple
@@ -16,9 +16,14 @@ from ..common.redis_stream import RedisStream
 from ..common.schema import Fill, Metric, ControlEvent
 from ..common.utils import utc_ms
 from ..executor.positions import Position
+from .backfill import BackfillScanner
 
 
 log = get_logger("risk")
+
+
+ORDER_ROUTE_TTL_MS = 60 * 60 * 1000
+ORDER_ROUTE_MAX = 10000
 
 
 @dataclass
@@ -102,7 +107,7 @@ class RollbackManager:
         if sample < int(self.guard_cfg.min_sample):
             return None
         delta_threshold = float(self.guard_cfg.winrate_delta_pp) / 100.0
-        if baseline - canary >= delta_threshold:
+        if baseline - canary > delta_threshold:
             reason = f"winrate_delta>{self.guard_cfg.winrate_delta_pp}pp"
             return self._execute(reason, now_ms)
         return None
@@ -343,6 +348,10 @@ def main():
     trade_cumulative_loss = float(trade_cfg.cumulative_loss)
     trade_slo_cfg = risk_settings.trade_slo
     trade_slo_window_ms = int(trade_slo_cfg.window_seconds * 1000)
+    rs.xadd(
+        "metrics:risk",
+        Metric(name="trades_per_hour_prev_release_p95", value=float(trade_slo_cfg.p95_prev_release)),
+    )
     exposure_cfg = risk_settings.exposure
     fail_safe_cfg = risk_settings.fail_safe
 
@@ -364,24 +373,72 @@ def main():
     def _make_route_stats() -> Dict[str, Any]:
         return {
             "trades_total": 0,
+            "maker_total": 0,
             "markout_avg": 0.0,
+            "cancel_total": 0,
             "precision_window": deque(maxlen=precision_window_len or None),
             "markout_window": deque(maxlen=markout_window_len or None),
             "markout_short_window": deque(maxlen=5),
         }
 
     route_stats: Dict[str, Dict[str, Any]] = defaultdict(_make_route_stats)
-    order_route_map: Dict[str, str] = {}
+    order_route_map: "OrderedDict[str, tuple[str, str, int]]" = OrderedDict()
+
+    def prune_order_routes(now_ms: int) -> None:
+        cutoff = now_ms - ORDER_ROUTE_TTL_MS
+        keys_to_remove = []
+        for order_id, (_, _, ts_ms) in list(order_route_map.items()):
+            if ts_ms < cutoff:
+                keys_to_remove.append(order_id)
+        for key in keys_to_remove:
+            order_route_map.pop(key, None)
+        while len(order_route_map) > ORDER_ROUTE_MAX:
+            order_route_map.popitem(last=False)
+
+    def record_order_route(order_id: str, route: str, symbol: str) -> None:
+        if not order_id:
+            return
+        order_route_map[order_id] = (route, symbol, utc_ms())
+        prune_order_routes(utc_ms())
+
+    def release_route(order_id: str) -> None:
+        if order_id:
+            order_route_map.pop(order_id, None)
+
+    def release_by_symbol(route: str, symbol: str | None) -> None:
+        if not symbol:
+            return
+        for key, value in list(order_route_map.items()):
+            route_val, symbol_val, _ = value
+            if route_val == route and symbol_val == symbol:
+                order_route_map.pop(key, None)
+                break
+
+    def emit_cancel_ratio(stats_map: Dict[str, Dict[str, Any]], stream: RedisStream, route: Optional[str]) -> None:
+        if route:
+            stats = stats_map[route]
+            trades = int(stats["trades_total"]) or 0
+            cancels = int(stats["cancel_total"]) or 0
+            ratio = float(cancels) / trades if trades > 0 else 0.0
+            stream.xadd(
+                "metrics:risk",
+                Metric(name="cancel_to_fill_ratio", value=ratio, labels={"route": route}),
+            )
+            return
+        total_trades = sum(int(s["trades_total"]) for s in stats_map.values())
+        total_cancels = sum(int(s["cancel_total"]) for s in stats_map.values())
+        ratio = float(total_cancels) / total_trades if total_trades > 0 else 0.0
+        stream.xadd("metrics:risk", Metric(name="cancel_to_fill_ratio", value=ratio))
 
     def route_for_order(order_id: str) -> str:
-        mapped = order_route_map.get(order_id)
-        if mapped:
-            return mapped
-        if rollout_mode == "full" and exchange_mode == "real":
-            return "full"
+        entry = order_route_map.get(order_id)
+        if entry:
+            return entry[0]
         if order_id.startswith("paper_"):
             return "paper"
-        return "real" if exchange_mode == "real" else "paper"
+        if exchange_mode == "real":
+            return "full"
+        return "paper"
 
     def handle_rollback_result(result: Optional[RollbackResult]) -> None:
         nonlocal rollout_mode
@@ -420,6 +477,7 @@ def main():
     benchmark = OnlineBenchmark(precision_window_len)
 
     log.info("risk_start")
+    backfill_scanner = BackfillScanner(cfg.risk.backfill_scanner, rs)
 
     group = "risk"
     consumer = "c1"
@@ -430,10 +488,12 @@ def main():
     while True:
         msgs = rs.read_group(group=group, consumer=consumer, streams=streams, block_ms=1000, count=100)
         if not msgs:
+            backfill_scanner.maybe_scan()
             continue
         for stream, items in msgs:
             for msg_id, data in items:
                 try:
+                    backfill_scanner.maybe_scan()
                     if stream == "metrics:signal":
                         metric = Metric.model_validate(data)
                         if metric.name == "gate_drop" and metric.labels:
@@ -469,8 +529,18 @@ def main():
                         if metric.name == "order_route_assignment" and metric.labels:
                             order_id = metric.labels.get("order_id")
                             route = metric.labels.get("route")
+                            symbol = metric.labels.get("symbol") if metric.labels else None
                             if order_id and route:
-                                order_route_map[order_id] = route
+                                record_order_route(order_id, route, symbol or "")
+                        elif metric.name == "orders_cancelled_total":
+                            labels = metric.labels or {}
+                            route = labels.get("route") or "paper"
+                            symbol = labels.get("symbol")
+                            stats = route_stats[route]
+                            stats["cancel_total"] += int(metric.value)
+                            emit_cancel_ratio(route_stats, rs, route)
+                            emit_cancel_ratio(route_stats, rs, None)
+                            release_by_symbol(route, symbol)
                         continue
 
                     if stream == "metrics:ai":
@@ -537,6 +607,7 @@ def main():
 
                     if fill.is_maker:
                         maker_total += 1
+                        stats["maker_total"] += 1
 
                     markout_avg = ((markout_avg * (trades_total - 1)) + fill.markout) / trades_total
                     precision_val = sum(precision_window) / (len(precision_window) or 1)
@@ -560,11 +631,33 @@ def main():
                     rs.xadd("metrics:risk", Metric(name="daily_pnl", value=daily_pnl))
                     rs.xadd("metrics:risk", Metric(name="trades_total", value=1.0))
                     if trade_pnl > 0:
-                        rs.xadd("metrics:risk", Metric(name="trades_won_total", value=1.0, labels={"symbol": fill.symbol}))
+                        rs.xadd(
+                            "metrics:risk",
+                            Metric(
+                                name="trades_won_total",
+                                value=1.0,
+                                labels={"symbol": fill.symbol, "route": route_label},
+                            ),
+                        )
+                        rs.xadd(
+                            "metrics:risk",
+                            Metric(name="trades_won_total", value=1.0, labels={"route": route_label}),
+                        )
                     rs.xadd("metrics:risk", Metric(name="rolling_precision", value=precision_val))
                     rs.xadd("metrics:risk", Metric(name="precision_breach_windows", value=float(precision_breach)))
                     rs.xadd("metrics:risk", Metric(name="rolling_recall", value=precision_val))
+                    route_fill_rate = stats["maker_total"] / trades_for_route if trades_for_route else 0.0
                     rs.xadd("metrics:risk", Metric(name="fill_rate_rolling", value=(maker_total / trades_total)))
+                    rs.xadd(
+                        "metrics:risk",
+                        Metric(
+                            name="fill_rate_rolling",
+                            value=route_fill_rate,
+                            labels={"route": route_label},
+                        ),
+                    )
+                    emit_cancel_ratio(route_stats, rs, route_label)
+                    emit_cancel_ratio(route_stats, rs, None)
                     rs.xadd("metrics:risk", Metric(name="avg_markout_total", value=markout_avg))
                     rs.xadd("metrics:risk", Metric(name="avg_markout_500ms", value=markout_recent))
                     rs.xadd("metrics:risk", Metric(name="avg_markout_100ms", value=markout_short))
@@ -594,7 +687,7 @@ def main():
                         Metric(name="avg_markout_1000ms", value=route_markout_1000, labels={"route": route_label}),
                     )
 
-                    order_route_map.pop(fill.order_id or "", None)
+                    release_route(fill.order_id or "")
 
                     trigger = None
                     reason = ""
