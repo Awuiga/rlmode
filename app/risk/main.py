@@ -355,10 +355,12 @@ def main():
         "metrics:risk",
         Metric(name="trades_per_hour_prev_release_p95", value=float(trade_slo_cfg.p95_prev_release)),
     )
+
     rs.xadd(
         "metrics:risk",
         Metric(name="p95_prev_release", value=float(trade_slo_cfg.p95_prev_release)),
     )
+
     exposure_cfg = risk_settings.exposure
     fail_safe_cfg = risk_settings.fail_safe
 

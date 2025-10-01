@@ -16,6 +16,12 @@ class RedisRetryConfig(BaseModel):
     backoff_ms: List[int] = Field(default_factory=lambda: [200, 400, 800, 1_600])
 
 
+class RedisRetryConfig(BaseModel):
+    idle_ms: int = 5_000
+    count: int = 50
+    backoff_ms: List[int] = Field(default_factory=lambda: [200, 400, 800, 1_600])
+
+
 class RedisConfig(BaseModel):
     url: str = Field(..., description="Redis connection URL")
     streams_maxlen: Optional[int] = None

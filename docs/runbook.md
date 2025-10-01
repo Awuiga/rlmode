@@ -26,6 +26,7 @@
 2. Enable temporary backpressure by tightening gates or reducing `rollout.canary_fraction`; consider switching to paper if fill rate degrades.
 3. After volume normalises, review latency profiles and cancel ratios before restoring the original rollout settings.
 
+
 ## Warm-up Gate Active
 1. Warm-up drops appear as `warmup_drop_total{symbol}` spikes when the executor restarts or a service is recycled.
 2. Confirm book depth and spreads look healthy before shortening `warmup.seconds`; never bypass the gate if collector lag or replay is ongoing.
@@ -34,6 +35,7 @@
 ## Zero Liquidity / Stale Book
 1. Inspect market depth snapshots and exchange websockets for disconnects; if liquidity is zero on either side, halt trading immediately.
 2. Confirm `liquidity_by_side` and `near_liq_guard` gates are firing; review `warmup_drop_total` for symbols entering protective mode.
+
 3. Switch the executor to paper (or stop trading) until order book depth and spreads recover for a sustained interval (at least 5 minutes of normalised depth).
 
 ## Rollback Guard Trigger
@@ -42,6 +44,7 @@
 3. Use the commands below to recover once metrics stabilise (typically after the 15 minute cooldown).
 
 ## Fail-safe Alert
+
 1. `control:events` with `severity="CRIT"` forces the executor into paper mode for the configured cooldown; inspect `fail_safe_trigger_total{reason}` and the accompanying `mode_switch_total{from,to}` labels for the trigger.
 2. Ensure `warmup_drop_total` and `backpressure_total` remain flat while in paper mode; once `fail_safe_trigger_total` stops incrementing, the cooldown has elapsed.
 3. Diagnose the upstream cause (connectivity, model outputs, exchange API errors) before restoring real execution with `EXCHANGE_MODE=real docker compose --profile real up -d ai_scorer executor risk`.
@@ -50,6 +53,7 @@
 1. Monitor `backpressure_total{mode}` and Redis stream depth (`XLEN sig:approved`) when alerts fire.
 2. Allow the automatic throttle to drain the queue; if backlog persists, raise gate thresholds or set `backpressure.drop_mode="halt"` temporarily to shed load.
 3. Once the queue returns below `backpressure.max_queue_len`, confirm canary win rate and fill rate recover before re-enabling full traffic.
+
 
 ## Data Gaps / Quality Issues
 1. Run `scripts/scan_parquet_gaps.py --root data/parquet` to locate missing partitions.

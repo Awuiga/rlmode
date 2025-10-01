@@ -31,3 +31,4 @@
 - `onnx_parity_fail_total` remains at zero for the entire session.
 - `schema_hash` in `model.json` matches the feature schema hash exported from FeatureState.
 - `trades_per_hour` stays below the configured throughput cap (`p95_prev_release * 1.5`).
+

@@ -26,7 +26,9 @@ from .sizing import (
 from ..exchange import create_exchange, PaperExchange
 from ..exchange.base import ExchangeAdapter
 from .failsafe import FailSafeGuard
+
 from .resilience import WarmupGate, BackpressureGuard
+
 from .reference import validate_exchange_reference
 
 
@@ -214,10 +216,12 @@ def main():
         window=256,
         emit_every=64,
     )
+
     warmup_gate = WarmupGate(cfg.warmup)
     backpressure_guard = BackpressureGuard(cfg.backpressure)
     fail_safe = FailSafeGuard(cfg.executor.fail_safe)
     last_fail_safe_active = False
+
 
     group = "exec"
     consumer = "c1"
@@ -258,6 +262,7 @@ def main():
                         elif evt_type == "ALERT":
                             severity = (evt.severity or evt.reason or "").upper()
                             if severity == "CRIT":
+
                                 triggered = fail_safe.activate(reason=evt.reason)
                                 remaining = fail_safe.remaining()
                                 if triggered:
@@ -288,6 +293,7 @@ def main():
                                     severity=severity,
                                     cooldown_s=int(remaining),
                                     reason=evt.reason,
+
                                 )
                         continue
                     else:
@@ -296,6 +302,7 @@ def main():
                             continue
                         sig = ApprovedSignal.model_validate(data)
                         sym = sig.symbol
+
                         if warmup_gate.should_drop():
                             rs.xadd(
                                 "metrics:executor",
@@ -661,6 +668,7 @@ def main():
                                         },
                                     ),
                                 )
+
                                 rs.xadd("metrics:executor", Metric(name="open_orders", value=float(len(open_orders))))
                                 if isinstance(selected_exchange, PaperExchange):
                                     selected_exchange.simulate_and_publish(order=order, is_last_in_ladder=(i == len(levels) - 1))

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+
 from typing import Optional, Callable
+
 
 
 @dataclass
 class FailSafeState:
     active_until: float = 0.0
+
     last_reason: Optional[str] = None
 
 
@@ -36,19 +39,24 @@ class FailSafeGuard:
         self.state.last_reason = reason
         return not was_active
 
+
     def is_active(self) -> bool:
         if self.state.active_until <= 0:
             return False
+
         if self._clock() >= self.state.active_until:
             self.state.active_until = 0.0
             self.state.last_reason = None
+
             return False
         return True
 
     def remaining(self) -> float:
         if not self.is_active():
             return 0.0
+
         return max(self.state.active_until - self._clock(), 0.0)
 
     def last_reason(self) -> Optional[str]:
         return self.state.last_reason
+

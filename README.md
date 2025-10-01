@@ -103,11 +103,13 @@ rollout:
 - `ThroughputSpike` (**warning**) &mdash; `trades_per_hour` exceeds `trades_per_hour_prev_release_p95` by 50%.
 - `ExecutionDegradation` (**critical**) &mdash; `fill_rate_rolling` falls below 25% while high-bucket ladder usage increases.
 
+
 ### Resilience
 
 - **Warm-up gate** &mdash; configure `warmup.enabled`/`warmup.seconds` in `config/app.yml` to delay execution until book state stabilises. Dropped signals increment `warmup_drop_total{symbol}` so dashboards surface cold starts.
 - **Backpressure controls** &mdash; `backpressure.enabled`, `max_queue_len`, and `drop_mode` govern how the executor reacts once `sig:approved` queues exceed capacity. In `halt` mode signals are dropped with `backpressure_total{mode="halt"}`, while `degrade` tightens ladder filters and reports `backpressure_total{mode="degrade"}` until depth recovers.
 - **Fail-safe mode** &mdash; `fail_safe.switch_to_paper_on_crit` and `cooldown_minutes` trigger an automatic exchange switch when `control:events` delivers a `CRIT` alert. Metrics `fail_safe_trigger_total{reason}` and `mode_switch_total{from,to}` document activations and the subsequent restoration to the baseline venue.
+
 - **Data health** &mdash; the risk service runs a parquet backfill scan (`parquet_gap_detected_ms`) and exchange reference validator (`exchange_reference_mismatch_total`) so operators can catch schema drift or venue setting mismatches before they cascade into production issues.
 
 

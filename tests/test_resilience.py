@@ -7,7 +7,9 @@ import pyarrow.parquet as pq
 from app.common.profiling import LatencyProfiler
 from app.common.schema import Metric
 from app.executor.failsafe import FailSafeGuard
+
 from app.executor.resilience import WarmupGate, BackpressureGuard
+
 from app.risk.backfill import BackfillScanner
 from app.signal_engine.backpressure import BackpressureController
 
@@ -42,6 +44,7 @@ def test_latency_profiler_emits_metrics():
     assert any(m.name == "latency_ms" and m.labels.get("quantile") == "p50" for _, m, _ in rs.records)
 
 
+
 def test_warmup_gate():
     now = [0.0]
 
@@ -67,6 +70,7 @@ def test_backpressure_guard_modes():
     assert degrade_guard.is_degraded() is True
     assert degrade_guard.evaluate(1) is None
     assert degrade_guard.is_degraded() is False
+
 
 
 def test_backpressure_throttles_on_backlog():
@@ -98,11 +102,14 @@ def test_backpressure_throttles_on_backlog():
     assert dropped >= 1
 
 
+
 def test_fail_safe_trigger(monkeypatch):
+
     now = [0.0]
 
     def fake_monotonic():
         return now[0]
+
 
     guard = FailSafeGuard(SimpleNamespace(enabled=True, duration_sec=60), clock=fake_monotonic)
     assert guard.activate(reason="crit") is True
@@ -112,6 +119,7 @@ def test_fail_safe_trigger(monkeypatch):
     now[0] = 61.0
     assert guard.is_active() is False
     assert guard.remaining() == 0.0
+
 
 
 def test_backfill_scanner_detects_gap(tmp_path):
