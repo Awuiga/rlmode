@@ -5,6 +5,8 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone, time as dtime
 from typing import Deque, Dict, Optional, Tuple
 
+import os
+
 import numpy as np
 
 from ..common.config import load_app_config
@@ -135,6 +137,9 @@ def _check_gates(
 
 def main():
     setup_logging()
+    if os.environ.get("RL_MODE_TEST_ENTRYPOINT") == "1":
+        log.info("entrypoint_test_skip", service="signal_engine")
+        return
     cfg = load_app_config()
     rs = RedisStream(
         cfg.redis.url,
@@ -161,7 +166,6 @@ def main():
     group = "sigeng"
     consumer = "c1"
     streams = ["md:raw"]
-    import os
     max_iters_env = int(os.environ.get("DRY_RUN_MAX_ITER", "0")) if "DRY_RUN_MAX_ITER" in os.environ else None
     processed = 0
     while True:

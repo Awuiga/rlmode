@@ -7,6 +7,9 @@ import pyarrow.parquet as pq
 from app.common.profiling import LatencyProfiler
 from app.common.schema import Metric
 from app.executor.failsafe import FailSafeGuard
+
+from app.executor.resilience import WarmupGate, BackpressureGuard
+
 from app.risk.backfill import BackfillScanner
 from app.signal_engine.backpressure import BackpressureController
 
@@ -41,6 +44,35 @@ def test_latency_profiler_emits_metrics():
     assert any(m.name == "latency_ms" and m.labels.get("quantile") == "p50" for _, m, _ in rs.records)
 
 
+
+def test_warmup_gate():
+    now = [0.0]
+
+    def fake_clock():
+        return now[0]
+
+    gate = WarmupGate(SimpleNamespace(enabled=True, seconds=90), clock=fake_clock)
+    assert gate.should_drop() is True
+    now[0] = 91.0
+    assert gate.should_drop() is False
+    assert gate.remaining() == 0.0
+
+
+def test_backpressure_guard_modes():
+    halt_guard = BackpressureGuard(SimpleNamespace(enabled=True, max_queue_len=5, drop_mode="halt"))
+    assert halt_guard.evaluate(10) == "halt"
+    assert halt_guard.should_drop() is True
+    assert halt_guard.evaluate(1) is None
+    assert halt_guard.should_drop() is False
+
+    degrade_guard = BackpressureGuard(SimpleNamespace(enabled=True, max_queue_len=5, drop_mode="degrade"))
+    assert degrade_guard.evaluate(10) == "degrade"
+    assert degrade_guard.is_degraded() is True
+    assert degrade_guard.evaluate(1) is None
+    assert degrade_guard.is_degraded() is False
+
+
+
 def test_backpressure_throttles_on_backlog():
     class FakeRedis:
         def __init__(self):
@@ -70,20 +102,24 @@ def test_backpressure_throttles_on_backlog():
     assert dropped >= 1
 
 
-def test_fail_safe_guard_activation(monkeypatch):
-    cfg = SimpleNamespace(enabled=True, duration_sec=1)
-    guard = FailSafeGuard(cfg)
+
+def test_fail_safe_trigger(monkeypatch):
+
     now = [0.0]
 
     def fake_monotonic():
         return now[0]
 
-    monkeypatch.setattr(time, "monotonic", fake_monotonic)
-    assert not guard.is_active()
-    guard.activate()
-    assert guard.is_active()
-    now[0] = 2.0
-    assert not guard.is_active()
+
+    guard = FailSafeGuard(SimpleNamespace(enabled=True, duration_sec=60), clock=fake_monotonic)
+    assert guard.activate(reason="crit") is True
+    assert guard.is_active() is True
+    assert guard.remaining() == 60
+    assert guard.activate(reason="crit") is False  # already active, extend window
+    now[0] = 61.0
+    assert guard.is_active() is False
+    assert guard.remaining() == 0.0
+
 
 
 def test_backfill_scanner_detects_gap(tmp_path):

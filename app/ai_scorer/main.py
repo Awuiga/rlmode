@@ -1149,6 +1149,9 @@ class AIScorerService:
 
 
 def main():
+    if os.environ.get("RL_MODE_TEST_ENTRYPOINT") == "1":
+        log.info("entrypoint_test_skip", service="ai_scorer")
+        return
     service = AIScorerService()
     service.run()
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import time
 from collections import defaultdict
 from typing import Dict, Mapping, Optional, Set, Tuple
@@ -25,6 +26,9 @@ from .sizing import (
 from ..exchange import create_exchange, PaperExchange
 from ..exchange.base import ExchangeAdapter
 from .failsafe import FailSafeGuard
+
+from .resilience import WarmupGate, BackpressureGuard
+
 from .reference import validate_exchange_reference
 
 
@@ -85,6 +89,12 @@ def _canary_vote(signal_id: str, rng_seed: int) -> float:
     return int.from_bytes(digest[:8], "big") / 2**64
 
 
+def _queue_length(rs: RedisStream, stream: str, group: str) -> int:
+    pending = max(rs.pending_length(stream, group), 0)
+    length = max(rs.stream_length(stream), 0)
+    return pending + length
+
+
 def decide_route_label(
     *,
     signal_id: str,
@@ -116,6 +126,9 @@ def decide_route_label(
 
 def main():
     setup_logging()
+    if os.environ.get("RL_MODE_TEST_ENTRYPOINT") == "1":
+        log.info("entrypoint_test_skip", service="executor")
+        return
     cfg = load_app_config()
     rs = RedisStream(
         cfg.redis.url,
@@ -127,14 +140,20 @@ def main():
     # Choose exchange client based on execution mode
     primary_exchange = create_exchange(cfg, rs, symbols_meta)
     rollout_mode = (cfg.rollout.mode or "disabled").lower()
-    exchange_mode = (cfg.exchange.mode or "paper").lower()
+    base_exchange_mode = (cfg.exchange.mode or "paper").lower()
+    current_exchange_mode = base_exchange_mode
     real_exchange: Optional[ExchangeAdapter] = None
     paper_exchange: Optional[PaperExchange] = None
     if isinstance(primary_exchange, PaperExchange):
         paper_exchange = primary_exchange
     else:
         real_exchange = primary_exchange
-    if rollout_mode == "canary" and exchange_mode == "real" and real_exchange is not None and paper_exchange is None:
+    if (
+        rollout_mode == "canary"
+        and base_exchange_mode == "real"
+        and real_exchange is not None
+        and paper_exchange is None
+    ):
         paper_exchange = PaperExchange(cfg=cfg.execution.simulator, rs=rs, symbols_meta=symbols_meta)
     validate_exchange_reference(primary_exchange, symbols_meta, rs)
 
@@ -197,14 +216,17 @@ def main():
         window=256,
         emit_every=64,
     )
-    warmup_deadline = time.monotonic() + max(int(cfg.executor.warmup_seconds), 0)
+
+    warmup_gate = WarmupGate(cfg.warmup)
+    backpressure_guard = BackpressureGuard(cfg.backpressure)
     fail_safe = FailSafeGuard(cfg.executor.fail_safe)
+    last_fail_safe_active = False
+
 
     group = "exec"
     consumer = "c1"
     streams = ["sig:approved", "control:events"]
 
-    import os
     max_iters_env = int(os.environ.get("DRY_RUN_MAX_ITER", "0")) if "DRY_RUN_MAX_ITER" in os.environ else None
     processed = 0
     while True:
@@ -240,18 +262,38 @@ def main():
                         elif evt_type == "ALERT":
                             severity = (evt.severity or evt.reason or "").upper()
                             if severity == "CRIT":
-                                fail_safe.activate()
+
+                                triggered = fail_safe.activate(reason=evt.reason)
                                 remaining = fail_safe.remaining()
-                                rs.xadd(
-                                    "metrics:executor",
-                                    Metric(
-                                        name="fail_safe_switch_total",
-                                        value=1.0,
-                                        labels={"reason": evt.reason or "alert"},
-                                    ),
-                                )
+                                if triggered:
+                                    rs.xadd(
+                                        "metrics:executor",
+                                        Metric(
+                                            name="fail_safe_trigger_total",
+                                            value=1.0,
+                                            labels={"reason": evt.reason or "alert"},
+                                        ),
+                                    )
+                                    if cfg.fail_safe.switch_to_paper_on_crit and base_exchange_mode != "paper":
+                                        current_exchange_mode = "paper"
+                                        rs.xadd(
+                                            "metrics:executor",
+                                            Metric(
+                                                name="mode_switch_total",
+                                                value=1.0,
+                                                labels={
+                                                    "from": base_exchange_mode,
+                                                    "to": "paper",
+                                                    "reason": "fail_safe",
+                                                },
+                                            ),
+                                        )
                                 log.warning(
-                                    "executor_fail_safe", severity=severity, cooldown_s=int(remaining)
+                                    "executor_fail_safe",
+                                    severity=severity,
+                                    cooldown_s=int(remaining),
+                                    reason=evt.reason,
+
                                 )
                         continue
                     else:
@@ -260,13 +302,61 @@ def main():
                             continue
                         sig = ApprovedSignal.model_validate(data)
                         sym = sig.symbol
-                        if time.monotonic() < warmup_deadline:
+
+                        if warmup_gate.should_drop():
                             rs.xadd(
                                 "metrics:executor",
-                                Metric(name="warmup_skip_total", value=1.0, labels={"symbol": sym}),
+                                Metric(name="warmup_drop_total", value=1.0, labels={"symbol": sym}),
                             )
-                            log.info("executor_warmup_skip", symbol=sym)
+                            log.info(
+                                "executor_drop",
+                                symbol=sym,
+                                reason="warmup",
+                                remaining_s=int(warmup_gate.remaining()),
+                            )
                             continue
+                        prev_degraded = backpressure_guard.is_degraded()
+                        prev_drop = backpressure_guard.should_drop()
+                        queue_len = _queue_length(rs, "sig:approved", group)
+                        mode = backpressure_guard.evaluate(queue_len)
+                        if mode == "halt":
+                            rs.xadd(
+                                "metrics:executor",
+                                Metric(
+                                    name="backpressure_total",
+                                    value=1.0,
+                                    labels={"mode": "halt", "symbol": sym},
+                                ),
+                            )
+                            log.warning(
+                                "executor_drop",
+                                reason="backpressure",
+                                symbol=sym,
+                                queue_len=queue_len,
+                                threshold=cfg.backpressure.max_queue_len,
+                            )
+                            continue
+                        if mode == "degrade" and not prev_degraded:
+                            rs.xadd(
+                                "metrics:executor",
+                                Metric(
+                                    name="backpressure_total",
+                                    value=1.0,
+                                    labels={"mode": "degrade", "symbol": sym},
+                                ),
+                            )
+                            log.warning(
+                                "executor_backpressure_degraded",
+                                queue_len=queue_len,
+                                threshold=cfg.backpressure.max_queue_len,
+                            )
+                        if mode is None and (prev_degraded or prev_drop):
+                            log.info(
+                                "executor_backpressure_recovered",
+                                queue_len=queue_len,
+                                threshold=cfg.backpressure.max_queue_len,
+                            )
+                        degraded = backpressure_guard.is_degraded()
                         now_ms = utc_ms()
                         prev_side = last_execution_side.get(sym)
                         if prev_side is not None and prev_side != sig.side:
@@ -317,6 +407,9 @@ def main():
                                 Metric(name="queue_position_proxy", value=qi_value, labels={"symbol": sym}),
                             )
                             aggressive = qi_value >= cfg.executor.qi_aggressive_threshold
+                            min_fill_probability = cfg.executor.min_fill_probability
+                            if degraded:
+                                min_fill_probability = min(0.95, max(min_fill_probability * 1.5, min_fill_probability))
                             spread_regime = int(sig.features.get("spread_regime", 1))
                             features = sig.features or {}
                             if cfg.executor.microprice_guard:
@@ -440,7 +533,7 @@ def main():
                             requested_route = decide_route_label(
                                 signal_id=signal_id,
                                 rollout_mode=rollout_mode,
-                                exchange_mode=exchange_mode,
+                                exchange_mode=current_exchange_mode,
                                 canary_fraction=cfg.rollout.canary_fraction,
                                 rng_seed=cfg.rollout.rng_seed,
                                 has_real=real_exchange is not None,
@@ -527,7 +620,7 @@ def main():
                                     "metrics:executor",
                                     Metric(name="expected_fill_probability", value=prob, labels={"symbol": sym, "level": str(lvl_idx)}),
                                 )
-                                if prob < cfg.executor.min_fill_probability:
+                                if prob < min_fill_probability:
                                     rs.xadd(
                                         "metrics:executor",
                                         Metric(
@@ -575,6 +668,7 @@ def main():
                                         },
                                     ),
                                 )
+
                                 rs.xadd("metrics:executor", Metric(name="open_orders", value=float(len(open_orders))))
                                 if isinstance(selected_exchange, PaperExchange):
                                     selected_exchange.simulate_and_publish(order=order, is_last_in_ladder=(i == len(levels) - 1))
@@ -602,6 +696,32 @@ def main():
                     log.error("executor_error", error=str(e))
                 finally:
                     rs.ack(stream, group, msg_id)
+                current_fail_safe_active = fail_safe.is_active()
+                if (
+                    last_fail_safe_active
+                    and not current_fail_safe_active
+                    and cfg.fail_safe.switch_to_paper_on_crit
+                    and current_exchange_mode != base_exchange_mode
+                ):
+                    rs.xadd(
+                        "metrics:executor",
+                        Metric(
+                            name="mode_switch_total",
+                            value=1.0,
+                            labels={
+                                "from": "paper",
+                                "to": base_exchange_mode,
+                                "reason": "fail_safe_clear",
+                            },
+                        ),
+                    )
+                    current_exchange_mode = base_exchange_mode
+                    log.info(
+                        "executor_fail_safe_cleared",
+                        reason=fail_safe.last_reason(),
+                        restored_mode=base_exchange_mode,
+                    )
+                last_fail_safe_active = current_fail_safe_active
                 processed += 1
                 if max_iters_env and processed >= max_iters_env:
                     log.info("executor_exit_dry_run", processed=processed)

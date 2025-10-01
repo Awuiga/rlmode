@@ -52,6 +52,9 @@ async def send_telegram(token: str, chat_id: str, text: str):
 
 def main():
     setup_logging()
+    if os.environ.get("RL_MODE_TEST_ENTRYPOINT") == "1":
+        log.info("entrypoint_test_skip", service="monitor")
+        return
     cfg = load_app_config()
     rs = RedisStream(cfg.redis.url, default_maxlen=cfg.redis.streams_maxlen)
 

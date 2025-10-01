@@ -28,6 +28,19 @@ rollout:
   canary_fraction: 0.10
   rng_seed: 1337
 
+warmup:
+  enabled: true
+  seconds: 90
+
+fail_safe:
+  switch_to_paper_on_crit: true
+  cooldown_minutes: 15
+
+backpressure:
+  enabled: true
+  max_queue_len: 10000
+  drop_mode: "halt" # halt | degrade
+
 rollout_guard:
   winrate_delta_pp: 5
   min_sample: 50

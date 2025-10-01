@@ -60,6 +60,8 @@ docker compose --profile paper up collector signal_engine ai_scorer executor
 EXCHANGE_MODE=real docker compose --profile real up collector signal_engine ai_scorer executor
 ```
 
+> **Important:** Services must be invoked via `python -m app.<service>.main`. The root-level scripts remain as thin compatibility wrappers and should not be used for deployments or automation.
+
 
 Canary & Rollback
 - Enable deterministic hashing by updating `config/app.yml`:
@@ -101,11 +103,13 @@ rollout:
 - `ThroughputSpike` (**warning**) &mdash; `trades_per_hour` exceeds `trades_per_hour_prev_release_p95` by 50%.
 - `ExecutionDegradation` (**critical**) &mdash; `fill_rate_rolling` falls below 25% while high-bucket ladder usage increases.
 
-### Resilience & Recovery
 
-- **Warm-up gate** &mdash; the executor refuses to trade for the first 90 seconds after start-up and emits `warmup_skip_total{symbol}` so that book state converges before the first ladder is placed.
-- **Backpressure controls** &mdash; the signal engine samples Redis stream depth and skips candidates when `sig:candidates` exceeds the configured backlog, incrementing `backpressure_total{symbol}` and lowering emission rate until the queue drains.
-- **Fail-safe mode** &mdash; a `control:events` alert with `severity="CRIT"` activates an automatic fail-over that routes all executions to the paper exchange for the configured cooldown while logging `fail_safe_switch_total{reason}` and `fail_safe_route_total{symbol}`.
+### Resilience
+
+- **Warm-up gate** &mdash; configure `warmup.enabled`/`warmup.seconds` in `config/app.yml` to delay execution until book state stabilises. Dropped signals increment `warmup_drop_total{symbol}` so dashboards surface cold starts.
+- **Backpressure controls** &mdash; `backpressure.enabled`, `max_queue_len`, and `drop_mode` govern how the executor reacts once `sig:approved` queues exceed capacity. In `halt` mode signals are dropped with `backpressure_total{mode="halt"}`, while `degrade` tightens ladder filters and reports `backpressure_total{mode="degrade"}` until depth recovers.
+- **Fail-safe mode** &mdash; `fail_safe.switch_to_paper_on_crit` and `cooldown_minutes` trigger an automatic exchange switch when `control:events` delivers a `CRIT` alert. Metrics `fail_safe_trigger_total{reason}` and `mode_switch_total{from,to}` document activations and the subsequent restoration to the baseline venue.
+
 - **Data health** &mdash; the risk service runs a parquet backfill scan (`parquet_gap_detected_ms`) and exchange reference validator (`exchange_reference_mismatch_total`) so operators can catch schema drift or venue setting mismatches before they cascade into production issues.
 
 

@@ -306,6 +306,9 @@ class RollbackManager:
 
 def main():
     setup_logging()
+    if os.environ.get("RL_MODE_TEST_ENTRYPOINT") == "1":
+        log.info("entrypoint_test_skip", service="risk")
+        return
     cfg = load_app_config()
     rs = RedisStream(cfg.redis.url, default_maxlen=cfg.redis.streams_maxlen)
     config_path = Path(os.environ.get("APP_CONFIG", "config/app.yml"))
@@ -352,6 +355,12 @@ def main():
         "metrics:risk",
         Metric(name="trades_per_hour_prev_release_p95", value=float(trade_slo_cfg.p95_prev_release)),
     )
+
+    rs.xadd(
+        "metrics:risk",
+        Metric(name="p95_prev_release", value=float(trade_slo_cfg.p95_prev_release)),
+    )
+
     exposure_cfg = risk_settings.exposure
     fail_safe_cfg = risk_settings.fail_safe
 

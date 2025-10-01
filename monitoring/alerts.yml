@@ -26,7 +26,9 @@ groups:
           summary: ONNX parity failures detected
           description: Training or inference emitted onnx_parity_fail_total > 0 within the last 10 minutes.
       - alert: DriftDetected
-        expr: max_over_time(psi_feature{feature!=""}[30m]) > 0.30 or max_over_time(ks_feature{feature!=""}[30m]) > 0.20
+
+        expr: max_over_time(psi_feature_*[30m]) > 0.30 OR max_over_time(ks_feature_*[30m]) > 0.20
+
         for: 0m
         labels:
           severity: critical
@@ -34,7 +36,9 @@ groups:
           summary: Feature drift detected
           description: PSI or KS drift metrics breached their configured guard rails within the last 30 minutes.
       - alert: CalibrationOutOfSpec
-        expr: ece_online{split="online"} > 0.05 or brier_online{split="online"} > brier_baseline_active{split="online"}
+
+        expr: ece_online > 0.05 OR brier_online > brier_baseline_active
+
         for: 10m
         labels:
           severity: warning
@@ -42,7 +46,9 @@ groups:
           summary: Calibration quality degraded
           description: Online calibration ECE exceeded 5% or Brier score regressed versus the active baseline.
       - alert: ThroughputSpike
-        expr: trades_per_hour > trades_per_hour_prev_release_p95 * 1.5
+
+        expr: trades_per_hour > p95_prev_release * 1.5
+
         for: 10m
         labels:
           severity: warning
@@ -58,7 +64,9 @@ groups:
           summary: Execution ladder aggressiveness degrading
           description: Fill rate dropped below 25% while high-aggression ladder usage is increasing, indicating execution issues.
       - alert: FailSafeActive
-        expr: increase(fail_safe_switch_total[1m]) > 0
+
+        expr: increase(fail_safe_trigger_total[1m]) > 0
+
         for: 0m
         labels:
           severity: warning

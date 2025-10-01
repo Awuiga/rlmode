@@ -7,7 +7,13 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, ConfigDict
+from pydantic import BaseModel, Field, ValidationError, ConfigDict, field_validator
+
+
+class RedisRetryConfig(BaseModel):
+    idle_ms: int = 5_000
+    count: int = 50
+    backoff_ms: List[int] = Field(default_factory=lambda: [200, 400, 800, 1_600])
 
 
 class RedisRetryConfig(BaseModel):
@@ -32,6 +38,30 @@ class CollectorConfig(BaseModel):
     ws: CollectorWSConfig = Field(default_factory=CollectorWSConfig)
     reconnect_backoff_ms: List[int] = Field(default_factory=lambda: [500, 1000, 2000, 5000])
     rate_limit_per_sec: int = 20
+
+
+class WarmupSettings(BaseModel):
+    enabled: bool = True
+    seconds: int = 90
+
+
+class FailSafeSettings(BaseModel):
+    switch_to_paper_on_crit: bool = True
+    cooldown_minutes: int = 15
+
+
+class RuntimeBackpressureConfig(BaseModel):
+    enabled: bool = True
+    max_queue_len: int = 10_000
+    drop_mode: str = "halt"
+
+    @field_validator("drop_mode")
+    @classmethod
+    def _validate_mode(cls, value: str) -> str:
+        normalized = (value or "halt").lower()
+        if normalized not in {"halt", "degrade"}:
+            raise ValueError("drop_mode must be 'halt' or 'degrade'")
+        return normalized
 
 
 
@@ -496,6 +526,9 @@ class AppConfig(BaseModel):
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
     rollout: RolloutConfig = Field(default_factory=RolloutConfig)
     rollout_guard: RolloutGuardConfig = Field(default_factory=RolloutGuardConfig)
+    warmup: WarmupSettings = Field(default_factory=WarmupSettings)
+    fail_safe: FailSafeSettings = Field(default_factory=FailSafeSettings)
+    backpressure: RuntimeBackpressureConfig = Field(default_factory=RuntimeBackpressureConfig)
     # New unified controls
     exchange_mode: str = Field(default="live_paper")  # live_paper | live_real
 
@@ -605,6 +638,12 @@ def load_app_config(path: Optional[str] = None) -> AppConfig:
             # ladder setup
             cfg.executor.ladder.fractions = cfg.signals.ladder
             cfg.executor.ladder.step_ticks = cfg.signals.ladder_step_ticks
+        if cfg.warmup.enabled:
+            cfg.executor.warmup_seconds = max(int(cfg.warmup.seconds), 0)
+        else:
+            cfg.executor.warmup_seconds = 0
+        cfg.executor.fail_safe.enabled = bool(cfg.fail_safe.switch_to_paper_on_crit)
+        cfg.executor.fail_safe.duration_sec = max(int(cfg.fail_safe.cooldown_minutes * 60), 0)
         feature_hash = _feature_config_hash(cfg.signal_engine.features)
         cfg.signal_engine.features.config_hash = feature_hash
         if cfg.ai_scorer.adaptive.base_entry is None:
