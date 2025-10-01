@@ -18,3 +18,16 @@
 - `model.json` must include `id`, `schema_hash`, `calibration`, and `thresholds` (`tau_entry`, `tau_hold`).
 - `schema_hash` must match the FeatureState hash at runtime; mismatches disable deployment.
 - `thresholds` are used for both live gating and shadow evaluation.
+
+## Release Criteria
+- Pass three canary sessions (normal, CPI, high-volatility) with:
+  - `winrate_rolling{route="canary"}` greater than or equal to the target win rate.
+- `avg_markout_{100,500,1000}ms{route="canary"}` >= 0.
+- `fill_rate_rolling{route="canary"}` >= 30%.
+- `cancel_to_fill_ratio{route="canary"}` <= 2.0.
+- `ece_online` <= 0.05 and `brier_online` below the active baseline.
+- Drift metrics `psi_feature_*`, `ks_feature_*` within configured blocks (<= 0.30 / <= 0.20).
+- `winrate_canary` >= `winrate_baseline_active - 0.05`.
+- `onnx_parity_fail_total` remains at zero for the entire session.
+- `schema_hash` in `model.json` matches the feature schema hash exported from FeatureState.
+- `trades_per_hour` stays below the configured throughput cap (`p95_prev_release * 1.5`).

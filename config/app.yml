@@ -17,11 +17,29 @@ market:
 
 redis:
   url: ${REDIS_URL:-redis://localhost:6379/0}
+  streams_maxlen: 10000
+  pending_retry:
+    idle_ms: 5000
+    count: 100
+    backoff_ms: [200, 400, 800, 1600]
 
 rollout:
   mode: "disabled"        # disabled | canary | full
   canary_fraction: 0.10
   rng_seed: 1337
+
+warmup:
+  enabled: true
+  seconds: 90
+
+fail_safe:
+  switch_to_paper_on_crit: true
+  cooldown_minutes: 15
+
+backpressure:
+  enabled: true
+  max_queue_len: 10000
+  drop_mode: "halt" # halt | degrade
 
 rollout_guard:
   winrate_delta_pp: 5
@@ -127,6 +145,12 @@ signal_engine:
       post_event_cooldown_ms: 300000
   tp_pct: 0.006
   sl_pct: 0.003
+  backpressure:
+    enabled: true
+    pending_threshold: 200
+    release_threshold: 80
+    drop_rate: 0.5
+    check_interval_ms: 500
 
 ais_scorer:
   model_type: lightgbm_meta
@@ -163,6 +187,10 @@ ais_scorer:
     frequency_hz: 50
     seconds: 2
     depth_levels: 10
+  batch_inference:
+    enabled: true
+    max_batch: 32
+    flush_interval_ms: 25
 
 executor:
   ladder:
@@ -198,6 +226,10 @@ executor:
     flips: 2
     window_ms: 400
     cooldown_ms: 2000
+  warmup_seconds: 90
+  fail_safe:
+    enabled: true
+    duration_sec: 600
 
 signals:
   tp_pct: 0.006
@@ -253,6 +285,16 @@ risk:
     enabled: true
     sl_buffer_multiplier: 1.5
   assumed_sl_pct: 0.003
+  fail_safe:
+    enabled: true
+    mode: paper
+    duration_sec: 300
+  backfill_scanner:
+    enabled: true
+    parquet_path: data/parquet
+    timestamp_column: ts
+    gap_threshold_ms: 60000
+    check_interval_sec: 300
 
 monitor:
   http_host: 0.0.0.0

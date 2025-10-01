@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone, time as dtime
 from typing import Deque, Dict, Optional, Tuple
+
+import os
 
 import numpy as np
 
@@ -12,7 +15,9 @@ from ..common.redis_stream import RedisStream
 from ..common.schema import MarketEvent, Candidate, Metric, Side
 from ..common.utils import utc_ms
 from ..features.core import FeatureState, compute_features
+from ..common.profiling import LatencyProfiler
 from .rules import apply_rules
+from .backpressure import BackpressureController
 
 HISTORY_WINDOW_MS = 1000
 
@@ -132,8 +137,15 @@ def _check_gates(
 
 def main():
     setup_logging()
+    if os.environ.get("RL_MODE_TEST_ENTRYPOINT") == "1":
+        log.info("entrypoint_test_skip", service="signal_engine")
+        return
     cfg = load_app_config()
-    rs = RedisStream(cfg.redis.url)
+    rs = RedisStream(
+        cfg.redis.url,
+        default_maxlen=cfg.redis.streams_maxlen,
+        pending_retry=cfg.redis.pending_retry,
+    )
 
     feature_cfg = cfg.signal_engine.features
     feat_state: Dict[str, FeatureState] = defaultdict(lambda: FeatureState.from_config(feature_cfg))
@@ -141,10 +153,19 @@ def main():
 
     log.info("signal_engine_start")
 
+    latency_profiler = LatencyProfiler(
+        rs=rs,
+        stream="metrics:signal",
+        metric_name="signal_pipeline_latency_ms",
+        labels={"stage": "feature_rules"},
+        window=256,
+        emit_every=64,
+    )
+    backpressure = BackpressureController(cfg.signal_engine.backpressure, rs)
+
     group = "sigeng"
     consumer = "c1"
     streams = ["md:raw"]
-    import os
     max_iters_env = int(os.environ.get("DRY_RUN_MAX_ITER", "0")) if "DRY_RUN_MAX_ITER" in os.environ else None
     processed = 0
     while True:
@@ -155,40 +176,54 @@ def main():
             for msg_id, data in items:
                 try:
                     ev = MarketEvent.model_validate(data)
-                    st = feat_state[ev.symbol]
-                    feats = compute_features(ev, st, depth_top_k=feature_cfg.depth_top_k)
-                    symbol_upper = ev.symbol.upper()
-                    history = feature_history[symbol_upper]
-                    history.append((ev.ts, dict(feats)))
-                    while history and ev.ts - history[0][0] > HISTORY_WINDOW_MS:
-                        history.popleft()
-                    reason = _check_gates(
-                        symbol=ev.symbol,
-                        ts=ev.ts,
-                        feats=feats,
-                        state=st,
-                        gates_cfg=cfg.signal_engine.gates,
-                        feature_history=feature_history,
-                    )
-                    if reason:
+                    if backpressure.should_throttle(ev.ts):
                         rs.xadd(
                             "metrics:signal",
-                            Metric(name="gate_drop_reason_total", value=1.0, labels={"reason": reason, "symbol": ev.symbol}),
+                            Metric(name="backpressure_total", value=1.0, labels={"symbol": ev.symbol}),
                         )
                         continue
-                    cand = apply_rules(
-                        ts=ev.ts,
-                        symbol=ev.symbol,
-                        feats=feats,
-                        side_hint=None,
-                        cfg_rules=cfg.signal_engine.rules,
-                        tp_pct=cfg.signal_engine.tp_pct,
-                        sl_pct=cfg.signal_engine.sl_pct,
-                        weights=cfg.signal_engine.scoring.weights.model_dump(),
-                        theta_emit=cfg.signal_engine.scoring.theta_emit,
-                    )
+                    with latency_profiler.track():
+                        st = feat_state[ev.symbol]
+                        feats = compute_features(ev, st, depth_top_k=feature_cfg.depth_top_k)
+                        feats.setdefault("signal_id", f"{ev.symbol}:{ev.ts}")
+                        symbol_upper = ev.symbol.upper()
+                        history = feature_history[symbol_upper]
+                        history.append((ev.ts, dict(feats)))
+                        while history and ev.ts - history[0][0] > HISTORY_WINDOW_MS:
+                            history.popleft()
+                        reason = _check_gates(
+                            symbol=ev.symbol,
+                            ts=ev.ts,
+                            feats=feats,
+                            state=st,
+                            gates_cfg=cfg.signal_engine.gates,
+                            feature_history=feature_history,
+                        )
+                        if reason:
+                            rs.xadd(
+                                "metrics:signal",
+                                Metric(
+                                    name="gate_drop_reason_total",
+                                    value=1.0,
+                                    labels={"reason": reason, "symbol": ev.symbol},
+                                ),
+                            )
+                            continue
+                        cand = apply_rules(
+                            ts=ev.ts,
+                            symbol=ev.symbol,
+                            feats=feats,
+                            side_hint=None,
+                            cfg_rules=cfg.signal_engine.rules,
+                            tp_pct=cfg.signal_engine.tp_pct,
+                            sl_pct=cfg.signal_engine.sl_pct,
+                            weights=cfg.signal_engine.scoring.weights.model_dump(),
+                            theta_emit=cfg.signal_engine.scoring.theta_emit,
+                        )
                     if cand:
-                        rs.xadd("sig:candidates", cand)
+                        signal_id = str(cand.features.get("signal_id") or f"{cand.symbol}:{cand.ts}")
+                        cand.features["signal_id"] = signal_id
+                        rs.xadd("sig:candidates", cand, idempotency_key=signal_id)
                         rs.xadd("metrics:signal", Metric(name="candidates_emitted_total", value=1.0))
                         processed += 1
                 except Exception as e:  # parsing/validation errors shouldn't kill loop

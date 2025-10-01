@@ -113,4 +113,5 @@ class ControlEvent(BaseModel):
     ts: int
     type: str  # e.g., STOP, START
     reason: str
+    severity: Optional[str] = None
     details: Optional[Dict[str, Any]] = None

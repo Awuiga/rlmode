@@ -34,11 +34,13 @@ def main() -> None:
             if key in params and key in ref and float(params[key]) != float(ref[key]):
                 issues.append({'symbol': symbol, 'field': key, 'expected': ref[key], 'actual': params[key]})
     report = {'issues': issues}
-    Path(args.output).write_text(json.dumps(report, indent=2))
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(report, indent=2))
     if issues:
         print(f'found {len(issues)} symbol discrepancies -> {args.output}')
-    else:
-        print('all symbols match reference')
+        raise SystemExit(f'symbol validation failed with {len(issues)} discrepancies')
+    print('all symbols match reference')
 
 
 if __name__ == '__main__':

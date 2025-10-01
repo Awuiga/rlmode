@@ -14,6 +14,12 @@ Release checklist
 - ONNX parity passes locally and no `onnx_parity_fail_total` increments in Prometheus
 - Canary pipeline passes all gates (winrate >= target, avg markout >= 0, fill-rate >= minimum)
 
+Release policy
+- Freeze the deployed thresholds (`tau_entry`, `tau_hold`) for 24 hours after a ramp before enabling auto-adaptive tuning with small step sizes.
+- Follow blue/green stages: keep the candidate in shadow for at least one trading day, run canary at 5–10% for 2–4 hours, then ramp through 25% → 50% → 100% while monitoring guard rails.
+- Log each release in `models/registry/manifest.json` with benchmark metrics, evaluation windows, and notes about the market regimes covered by the data.
+- Use `scripts/release.sh --shadow-id <MODEL_ID>` to orchestrate the validation → promote shadow → enable canary → monitor → promote to full rollout flow. Pass `--disable-rollout` to end the run with rollout disabled after validation or `--skip-validations` when rerunning during the same release.
+
 Advanced toolkit
 - `scripts/calibrate_fill_model.py` builds empirical fill curves from historical fills.
 - `scripts/simulate_execution.py` runs Monte-Carlo latency and shock scenarios (outputs JSON report).
@@ -54,42 +60,56 @@ docker compose --profile paper up collector signal_engine ai_scorer executor
 EXCHANGE_MODE=real docker compose --profile real up collector signal_engine ai_scorer executor
 ```
 
+> **Important:** Services must be invoked via `python -m app.<service>.main`. The root-level scripts remain as thin compatibility wrappers and should not be used for deployments or automation.
 
-Canary routing
-- Toggle rollout knobs in `config/app.yml`:
+
+Canary & Rollback
+- Enable deterministic hashing by updating `config/app.yml`:
 
 ```yaml
 rollout:
-  mode: "canary"
+  mode: "canary"      # disabled | canary | full
   canary_fraction: 0.10
   rng_seed: 1337
 ```
 
-- Launch executor against real venue to activate deterministic hashing:
+- Start the executor against a real venue so that ~10% of approved signals hash to `route="canary"` (real exchange) and the remainder stay on the paper simulator: `EXCHANGE_MODE=real python -m app.executor.main`.
+- The executor tags every order with `trades_opened_total{route="canary|paper|full"}` so downstream dashboards can split performance. Risk publishes per-route gauges for `trades_won_total`, `winrate_rolling`, `fill_rate_rolling`, `avg_markout_{100,500,1000}ms`, and `cancel_to_fill_ratio`. Canary supervision exports `winrate_baseline_active`, `winrate_canary`, `sample_canary`, `mode_switch_total`, `rollback_total`, `brier_online`, `ece_online`, `brier_baseline_active`, `psi_feature_*`, `psi_feature{feature}`, `ks_feature_*`, `ks_feature{feature}`, `tau_entry_current{model}`, `tau_hold_current{model}`, `trades_per_hour`, and `trades_per_hour_prev_release_p95`. AI scoring exposes `model_score_distribution{split="online"}`, `shadow_score_distribution{split="online"}`, `onnx_parity_fail_total`, and `parquet_schema_version_mismatch_total` while the executor tracks `exec_ladder_aggressiveness_total{bucket}`.
+- Guard rails live under `rollout_guard` in `config/app.yml` (winrate delta in percentage points, minimum sample, PSI/KS blocks, cooldown window). Canary is automatically rolled back when **any** of the following hold:
+  1. `sample_canary >= min_sample` **and** `winrate_canary < winrate_baseline_active - winrate_delta_pp`
+  2. `increase(onnx_parity_fail_total[10m]) > 0`
+  3. `max_over_time(psi_feature_*[30m]) > psi_block` **or** `max_over_time(ks_feature_*[30m]) > ks_block`
+- On rollback the supervisor switches `models/registry/active` back to the previous manifest entry, writes `rollout.mode="disabled"`, emits a `MODE_SWITCH{from,to}` control event, and increments `mode_switch_total`/`rollback_total` with the reason label. Cooldown (default 15 minutes) prevents thrashing while operators investigate.
+- Promote a new build or revert manually with `scripts/promote_model.py --to active --id MODEL_ID` (forward) and `scripts/promote_model.py --to active --id PREVIOUS_ID` (rollback). Re-enable full routing by setting `rollout.mode="full"`; set `"disabled"` to fall back to paper-only execution.
 
-```bash
-EXCHANGE_MODE=real python -m app.executor.main
-```
+### Observability & Alerts
 
-- Switch `rollout.mode` to `full` for 100% real flow or back to `disabled` to restore legacy routing.
+#### Grafana dashboard
+- **Win Rate by Route** &mdash; compares `winrate_rolling{route}` against the aggregate `winrate_baseline_active`. Expect canary to track the baseline; drops below the yellow 50% threshold require investigation.
+- **Markout & Fill Rate** &mdash; overlays `avg_markout_1000ms{route}` with `fill_rate_rolling{route}`. Markouts should stay above zero while fill rate remains above the 25% green target.
+- **Score Distribution (Online)** &mdash; tracks `model_score_distribution{stat="mean"}` and `shadow_score_distribution`. Divergence or collapsing standard deviation warns of calibration or shadow drift.
+- **Calibration** &mdash; plots `brier_online`, `brier_baseline_active`, and `ece_online`. The Brier curve should remain below the baseline, ECE below 5%.
+- **Drift PSI / KS** &mdash; visualises `psi_feature` and `ks_feature` grouped by feature name. PSI > 0.3 or KS > 0.2 highlights meaningful drift.
+- **Execution Ladder Aggressiveness** &mdash; compares `rate(exec_ladder_aggressiveness_total{bucket}[5m])` across aggression buckets to spot skew towards marketable orders.
+- **Parity & Schema** &mdash; `increase(onnx_parity_fail_total[5m])` and `increase(parquet_schema_version_mismatch_total[5m])` surface inference or data compatibility issues.
+- **Rollouts & Mode Switches** &mdash; shows `increase(mode_switch_total[30m])` and `increase(rollback_total[30m])` to summarise automated and manual interventions.
 
+#### Alert catalogue
+- `WinRateDrop` (**critical**) &mdash; `rolling_precision < 0.5` for 10 minutes.
+- `CanaryWinrateDrop` (**warning**) &mdash; Canary win rate trails baseline by more than five percentage points over 30 minutes.
+- `OnnxParityFailure` (**warning**) &mdash; any increment of `onnx_parity_fail_total` within 10 minutes.
+- `DriftDetected` (**critical**) &mdash; `psi_feature` > 0.30 or `ks_feature` > 0.20 in the last 30 minutes.
+- `CalibrationOutOfSpec` (**warning**) &mdash; `ece_online > 0.05` or `brier_online` above the live baseline.
+- `ThroughputSpike` (**warning**) &mdash; `trades_per_hour` exceeds `trades_per_hour_prev_release_p95` by 50%.
+- `ExecutionDegradation` (**critical**) &mdash; `fill_rate_rolling` falls below 25% while high-bucket ladder usage increases.
 
-Online Benchmarking
-- The risk supervisor keeps a rolling baseline winrate using `risk.precision.window` samples from active real trades (routes `real` and `full`).
-- Canary trades (`route="canary"`) maintain their own rolling winrate and sample counter so you can compare uplift without triggering automatic halts.
-- Exported metrics:
-  - `winrate_baseline_active`
-  - `winrate_canary`
-  - `sample_canary`
-- When no canary trades are in the window (`sample_canary = 0`), `winrate_canary` is reported as `0.0` by design; treat that as "insufficient data".
-- Use Grafana/Prometheus to overlay `winrate_canary` vs `winrate_baseline_active` over identical windows and monitor convergence before promotions.
+### Resilience
 
-Rollback
-- Configure guard rails via `rollout_guard` in `config/app.yml` (winrate delta, PSI/KS limits, cooldown).
-- Canary underperformance beyond the configured delta with sufficient samples triggers an automatic rollback.
-- Any increase in `onnx_parity_fail_total` or PSI/KS drift metric breaching the guard thresholds also triggers.
-- On rollback the supervisor reverts `models/registry/active` to the previous manifest entry, disables rollout, and emits `MODE_SWITCH` plus `mode_switch_total`/`rollback_total` metrics.
-- The cooldown window (default 15 minutes) blocks repeated rollbacks until operators clear the issue.
+- **Warm-up gate** &mdash; configure `warmup.enabled`/`warmup.seconds` in `config/app.yml` to delay execution until book state stabilises. Dropped signals increment `warmup_drop_total{symbol}` so dashboards surface cold starts.
+- **Backpressure controls** &mdash; `backpressure.enabled`, `max_queue_len`, and `drop_mode` govern how the executor reacts once `sig:approved` queues exceed capacity. In `halt` mode signals are dropped with `backpressure_total{mode="halt"}`, while `degrade` tightens ladder filters and reports `backpressure_total{mode="degrade"}` until depth recovers.
+- **Fail-safe mode** &mdash; `fail_safe.switch_to_paper_on_crit` and `cooldown_minutes` trigger an automatic exchange switch when `control:events` delivers a `CRIT` alert. Metrics `fail_safe_trigger_total{reason}` and `mode_switch_total{from,to}` document activations and the subsequent restoration to the baseline venue.
+- **Data health** &mdash; the risk service runs a parquet backfill scan (`parquet_gap_detected_ms`) and exchange reference validator (`exchange_reference_mismatch_total`) so operators can catch schema drift or venue setting mismatches before they cascade into production issues.
+
 
 
 Sizing & Near-Liq Guard

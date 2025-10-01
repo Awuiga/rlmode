@@ -7,12 +7,19 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, ConfigDict
+from pydantic import BaseModel, Field, ValidationError, ConfigDict, field_validator
+
+
+class RedisRetryConfig(BaseModel):
+    idle_ms: int = 5_000
+    count: int = 50
+    backoff_ms: List[int] = Field(default_factory=lambda: [200, 400, 800, 1_600])
 
 
 class RedisConfig(BaseModel):
     url: str = Field(..., description="Redis connection URL")
     streams_maxlen: Optional[int] = None
+    pending_retry: RedisRetryConfig = Field(default_factory=RedisRetryConfig)
 
 
 class CollectorWSConfig(BaseModel):
@@ -25,6 +32,30 @@ class CollectorConfig(BaseModel):
     ws: CollectorWSConfig = Field(default_factory=CollectorWSConfig)
     reconnect_backoff_ms: List[int] = Field(default_factory=lambda: [500, 1000, 2000, 5000])
     rate_limit_per_sec: int = 20
+
+
+class WarmupSettings(BaseModel):
+    enabled: bool = True
+    seconds: int = 90
+
+
+class FailSafeSettings(BaseModel):
+    switch_to_paper_on_crit: bool = True
+    cooldown_minutes: int = 15
+
+
+class RuntimeBackpressureConfig(BaseModel):
+    enabled: bool = True
+    max_queue_len: int = 10_000
+    drop_mode: str = "halt"
+
+    @field_validator("drop_mode")
+    @classmethod
+    def _validate_mode(cls, value: str) -> str:
+        normalized = (value or "halt").lower()
+        if normalized not in {"halt", "degrade"}:
+            raise ValueError("drop_mode must be 'halt' or 'degrade'")
+        return normalized
 
 
 
@@ -174,6 +205,16 @@ class GatesConfig(BaseModel):
     session: SessionGateConfig = Field(default_factory=SessionGateConfig)
 
 
+class BackpressureConfig(BaseModel):
+    enabled: bool = True
+    stream: str = "sig:candidates"
+    group: str = "aiscore"
+    pending_threshold: int = 250
+    release_threshold: int = 120
+    drop_rate: float = 0.5
+    check_interval_ms: int = 750
+
+
 class SignalEngineConfig(BaseModel):
     features: FeatureConfig = Field(default_factory=FeatureConfig)
     rules: RulesConfig = Field(default_factory=RulesConfig)
@@ -181,6 +222,7 @@ class SignalEngineConfig(BaseModel):
     gates: GatesConfig = Field(default_factory=GatesConfig)
     tp_pct: float = 0.006
     sl_pct: float = 0.003
+    backpressure: BackpressureConfig = Field(default_factory=BackpressureConfig)
 
 
 class AIScorerWindow(BaseModel):
@@ -247,6 +289,7 @@ class AIScorerDriftConfig(BaseModel):
     ks_alert: float = 0.2
     brier_alert: float = 0.2
     ece_alert: float = 0.1
+    brier_baseline: float = 0.15
 
 
 class AIScorerShadowConfig(BaseModel):
@@ -270,6 +313,12 @@ class AIScorerDeploymentConfig(BaseModel):
     auto_failover: bool = True
 
 
+class AIScorerBatchConfig(BaseModel):
+    enabled: bool = True
+    max_batch: int = 32
+    flush_interval_ms: int = 20
+
+
 class AIScorerConfig(BaseModel):
     # Silence Pydantic warning for field name starting with 'model_'
     model_config = ConfigDict(protected_namespaces=())
@@ -288,6 +337,7 @@ class AIScorerConfig(BaseModel):
     deployment: AIScorerDeploymentConfig = Field(default_factory=AIScorerDeploymentConfig)
     rollout_guard: AIScorerRolloutGuardConfig = Field(default_factory=AIScorerRolloutGuardConfig)
     window: AIScorerWindow = Field(default_factory=AIScorerWindow)
+    batch_inference: AIScorerBatchConfig = Field(default_factory=AIScorerBatchConfig)
 
 
 class LadderConfig(BaseModel):
@@ -343,6 +393,11 @@ class ExposureCapsConfig(BaseModel):
     reference_equity: float = 1.0
 
 
+class ExecutorFailSafeConfig(BaseModel):
+    enabled: bool = True
+    duration_sec: int = 300
+
+
 class ExecutorConfig(BaseModel):
     ladder: LadderConfig = Field(default_factory=LadderConfig)
     tif: str = "GTC"
@@ -365,6 +420,8 @@ class ExecutorConfig(BaseModel):
     sizing: ExecutorSizingConfig = Field(default_factory=ExecutorSizingConfig)
     gates: ExecutorGatesConfig = Field(default_factory=ExecutorGatesConfig)
     microprice_flip_guard: MicropriceFlipGuardConfig = Field(default_factory=MicropriceFlipGuardConfig)
+    warmup_seconds: int = 90
+    fail_safe: ExecutorFailSafeConfig = Field(default_factory=ExecutorFailSafeConfig)
 
 
 class MonitorConfig(BaseModel):
@@ -403,6 +460,14 @@ class TradeSLOConfig(BaseModel):
     window_seconds: int = 3600
     max_trades: int = 200
     alert_only: bool = False
+    p95_prev_release: int = 120
+
+
+class TradeClusterConfig(BaseModel):
+    enabled: bool = False
+    window_ms: int = 60000
+    max_trades: int = 3
+    cumulative_loss: float = -0.0005
 
 
 class RiskExposureConfig(BaseModel):
@@ -418,6 +483,14 @@ class FailSafeConfig(BaseModel):
     duration_sec: int = 300
 
 
+class BackfillScannerConfig(BaseModel):
+    enabled: bool = True
+    parquet_path: str = "data/parquet"
+    timestamp_column: str = "ts"
+    gap_threshold_ms: int = 60_000
+    check_interval_sec: int = 300
+
+
 class RiskConfig(BaseModel):
     enable: bool = True
     precision: PrecisionHaltConfig = Field(default_factory=PrecisionHaltConfig)
@@ -429,6 +502,7 @@ class RiskConfig(BaseModel):
     near_liq_guard: NearLiqGuardConfig = Field(default_factory=NearLiqGuardConfig)
     assumed_sl_pct: float = 0.0
     fail_safe: FailSafeConfig = Field(default_factory=FailSafeConfig)
+    backfill_scanner: BackfillScannerConfig = Field(default_factory=BackfillScannerConfig)
 
 
 class AppConfig(BaseModel):
@@ -446,6 +520,9 @@ class AppConfig(BaseModel):
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
     rollout: RolloutConfig = Field(default_factory=RolloutConfig)
     rollout_guard: RolloutGuardConfig = Field(default_factory=RolloutGuardConfig)
+    warmup: WarmupSettings = Field(default_factory=WarmupSettings)
+    fail_safe: FailSafeSettings = Field(default_factory=FailSafeSettings)
+    backpressure: RuntimeBackpressureConfig = Field(default_factory=RuntimeBackpressureConfig)
     # New unified controls
     exchange_mode: str = Field(default="live_paper")  # live_paper | live_real
 
@@ -555,6 +632,12 @@ def load_app_config(path: Optional[str] = None) -> AppConfig:
             # ladder setup
             cfg.executor.ladder.fractions = cfg.signals.ladder
             cfg.executor.ladder.step_ticks = cfg.signals.ladder_step_ticks
+        if cfg.warmup.enabled:
+            cfg.executor.warmup_seconds = max(int(cfg.warmup.seconds), 0)
+        else:
+            cfg.executor.warmup_seconds = 0
+        cfg.executor.fail_safe.enabled = bool(cfg.fail_safe.switch_to_paper_on_crit)
+        cfg.executor.fail_safe.duration_sec = max(int(cfg.fail_safe.cooldown_minutes * 60), 0)
         feature_hash = _feature_config_hash(cfg.signal_engine.features)
         cfg.signal_engine.features.config_hash = feature_hash
         if cfg.ai_scorer.adaptive.base_entry is None:

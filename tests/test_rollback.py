@@ -52,12 +52,38 @@ def test_winrate_degradation_triggers_rollback(tmp_path):
         registry_root=registry,
         initial_mode="canary",
     )
-    result = manager.update_winrates(baseline=0.60, canary=0.40, sample=50, now_ms=0)
+    now_ms = 1_000
+    result = manager.update_winrates(baseline=0.60, canary=0.40, sample=50, now_ms=now_ms)
     assert result and result.executed
+    assert result.reason.startswith("winrate_delta>")
+    assert result.from_mode == "canary"
+    assert result.to_mode == "disabled"
+    assert result.active_model == "model_b"
+    assert result.target_model == "model_a"
+    assert manager.current_rollout_mode == "disabled"
+    assert manager.cooldown_until == now_ms + guard_cfg.cooldown_minutes * 60 * 1000
     active_meta = json.loads((registry / "active" / "model.json").read_text())
     assert active_meta["id"] == "model_a"
     raw_cfg = yaml.safe_load(config_path.read_text())
     assert raw_cfg["rollout"]["mode"] == "disabled"
+
+
+def test_winrate_delta_requires_strict_drop(tmp_path):
+    registry = _prepare_registry(tmp_path, ["model_a", "model_b"])
+    config_path = _prepare_config(tmp_path, mode="canary")
+    guard_cfg = RolloutGuardConfig(
+        winrate_delta_pp=5,
+        min_sample=50,
+    )
+    manager = RollbackManager(
+        guard_cfg=guard_cfg,
+        config_path=config_path,
+        registry_root=registry,
+        initial_mode="canary",
+    )
+    now_ms = 10_000
+    result = manager.update_winrates(baseline=0.60, canary=0.55, sample=50, now_ms=now_ms)
+    assert result is None
 
 
 def test_parity_fail_triggers_rollback(tmp_path):
@@ -73,6 +99,26 @@ def test_parity_fail_triggers_rollback(tmp_path):
     assert manager.record_parity_metric(0.0, {"stage": "online"}, now_ms=0) is None
     result = manager.record_parity_metric(1.0, {"stage": "online"}, now_ms=1_000)
     assert result and result.executed
+    assert "onnx_parity_fail" in result.reason
+    active_meta = json.loads((registry / "active" / "model.json").read_text())
+    assert active_meta["id"] == "model_a"
+
+
+def test_ks_drift_triggers_rollback(tmp_path):
+    registry = _prepare_registry(tmp_path, ["model_a", "model_b"])
+    config_path = _prepare_config(tmp_path, mode="canary")
+    guard_cfg = RolloutGuardConfig(ks_block=0.2)
+    manager = RollbackManager(
+        guard_cfg=guard_cfg,
+        config_path=config_path,
+        registry_root=registry,
+        initial_mode="canary",
+    )
+    result = manager.record_ks_metric("ks_feature_score", 0.25, now_ms=5_000)
+    assert result and result.executed
+    assert "ks_feature_score" in result.reason
+    active_meta = json.loads((registry / "active" / "model.json").read_text())
+    assert active_meta["id"] == "model_a"
 
 
 def test_cooldown_blocks_duplicate_rollbacks(tmp_path):

@@ -220,6 +220,9 @@ async def bybit_stream(rs: RedisStream, symbols: List[str], depth_levels: int, u
 
 def main():
     setup_logging()
+    if os.environ.get("RL_MODE_TEST_ENTRYPOINT") == "1":
+        log.info("entrypoint_test_skip", service="collector")
+        return
     cfg = load_app_config()
     rs = RedisStream(cfg.redis.url)
 

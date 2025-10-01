@@ -37,10 +37,15 @@ def main() -> None:
 
     root = Path(args.root)
     if not root.exists():
-        raise SystemExit(f'{root} does not exist')
+        print(f'{root} does not exist, skipping parquet gap scan')
+        return
     issues = scan_directory(root, args.threshold_ms)
-    Path(args.output).write_text(json.dumps({'issues': issues}, indent=2))
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps({'issues': issues}, indent=2))
     print(f'scanned {root}, found {len(issues)} gaps')
+    if issues:
+        raise SystemExit(f'parquet gaps detected: {len(issues)} issues > threshold')
 
 
 if __name__ == '__main__':
