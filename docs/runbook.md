@@ -6,6 +6,18 @@
 3. If automatic rollback did **not** trigger, immediately issue a manual rollback (see [Operational Commands](#operational-commands)). Keep rollout disabled until post-mortem completes.
 4. Compare latest model reliability plots, threshold sweep and feature deltas against the previous release; restore the last good manifest entry if regression is confirmed.
 
+## Daily Cap Breach (`daily_cap`)
+1. Switch the executor to paper mode to prevent further losses (`EXCHANGE_MODE=paper python -m app.executor.main` or update `config/app.yml`).
+2. Confirm `daily_cap_trigger_total` incremented and that realised PnL in Grafana/Prometheus matches the configured `daily_loss_cap_usd` threshold.
+3. Review the most recent trades to identify systemic issues (latency spikes, symbol outages, strategy regressions) before resuming.
+4. Resume trading only after the next UTC trading day begins or the cap reset is confirmed; restart in real mode once risk sign-off is recorded.
+
+## Loss Streak Halt (`streak_halt`)
+1. Keep the executor in paper mode during the configured `session_cooldown_minutes` cooldown window to allow order flow to stabilise.
+2. Validate `streak_halt_total` and streak metrics in Grafana, ensuring the consecutive loss counter has reset to zero before re-enabling.
+3. Audit the sequence of losing trades for anomalies (market regime shifts, model outputs, venue issues) and document findings.
+4. After the cooldown expires and metrics stabilise, bring the executor back to real mode and monitor closely for recurring streaks.
+
 ## Volatility Halt
 1. Review depth/spread metrics and market news calendars to confirm the halt is expected (e.g. CPI, FOMC, liquidation cascades).
 2. Validate that execution SLOs (`avg_markout_*`, `fill_rate_rolling`, `cancel_to_fill_ratio`) remain within acceptable tolerances.

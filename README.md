@@ -1,5 +1,16 @@
 
 
+### Development
+
+- All services must be launched via `python -m app.<service>.main`.
+- Local artifacts (.venv, __pycache__, data/redis, .env) must not be committed.
+
+#### Risk controls
+
+- `daily_loss_cap_usd` halts risk routing for the day once realised PnL breaches the configured negative threshold and emits `daily_cap_trigger_total` with drop reason `daily_cap`.
+- `loss_streak_max` tracks consecutive losing trades; once the streak length reaches the limit, risk stops taking signals, records `streak_halt_total`, and applies `session_cooldown_minutes` before trading resumes.
+- `near_liquidation_short` protects short entries by comparing the estimated liquidation price to the assumed stop-loss distance and drops signals with reason `near_liquidation_short` if collateral is too thin.
+
 Model pipeline recipe
 - regenerate parquet with `python dump_market_to_parquet.py --config config/app.yml`
 - apply labels via `python labeling.py` or the ETL job defined in `labeling.py`
@@ -83,6 +94,10 @@ rollout:
 - Promote a new build or revert manually with `scripts/promote_model.py --to active --id MODEL_ID` (forward) and `scripts/promote_model.py --to active --id PREVIOUS_ID` (rollback). Re-enable full routing by setting `rollout.mode="full"`; set `"disabled"` to fall back to paper-only execution.
 
 ### Observability & Alerts
+
+#### Canary fraction realized
+- The executor exports `executor_canary_fraction_realized`, the ratio of canary orders opened to total live (canary + paper) orders opened.
+- Alert `CanaryFractionDeviation` fires when the realised fraction diverges from the rollout target by more than three percentage points for 15 minutes; tune the target via `config/rollout.canary_fraction`.
 
 #### Grafana dashboard
 - **Win Rate by Route** &mdash; compares `winrate_rolling{route}` against the aggregate `winrate_baseline_active`. Expect canary to track the baseline; drops below the yellow 50% threshold require investigation.

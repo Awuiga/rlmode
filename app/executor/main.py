@@ -166,6 +166,8 @@ def main():
     order_symbol: Dict[str, str] = {}
     order_exchange: Dict[str, ExchangeAdapter] = {}
     order_route: Dict[str, str] = {}
+    canary_opened = 0
+    paper_opened = 0
 
     def emit_cancel_metric(order_id: str) -> None:
         route = order_route.get(order_id)
@@ -562,6 +564,18 @@ def main():
                                 rs.xadd(
                                     "metrics:executor",
                                     Metric(name="trades_opened_total", value=1.0, labels={"symbol": sym, "route": route_label}),
+                                )
+                                if route_label == "canary":
+                                    canary_opened += 1
+                                elif route_label == "paper":
+                                    paper_opened += 1
+                                canary_fraction_realized = canary_opened / max(1, canary_opened + paper_opened)
+                                rs.xadd(
+                                    "metrics:executor",
+                                    Metric(
+                                        name="executor_canary_fraction_realized",
+                                        value=float(canary_fraction_realized),
+                                    ),
                                 )
     
                             if aggressive:

@@ -1,4 +1,7 @@
 enable: true
+daily_loss_cap_usd: 500.0
+loss_streak_max: 3
+session_cooldown_minutes: 60
 precision:
   window: 50
   min_precision: 0.55
@@ -18,3 +21,6 @@ trade_cluster:
   window_ms: 60000
   max_trades: 3
   cumulative_loss: -0.0005
+near_liq_guard:
+  enabled: true
+  sl_buffer_multiplier: 1.5

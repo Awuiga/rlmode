@@ -17,6 +17,14 @@ groups:
         annotations:
           summary: Canary winrate dropped versus baseline
           description: Canary winrate fell more than 5 percentage points below the active baseline.
+      - alert: CanaryFractionDeviation
+        # <TARGET_FRACTION_VAR> should be wired from config/rollout.canary_fraction
+        expr: abs(executor_canary_fraction_realized - <TARGET_FRACTION_VAR>) > 0.03
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Canary fraction deviates from target
       - alert: OnnxParityFailure
         expr: increase(onnx_parity_fail_total[10m]) > 0
         for: 0m

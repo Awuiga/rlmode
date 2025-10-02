@@ -5,6 +5,7 @@ import os
 import shutil
 from collections import deque, defaultdict, OrderedDict
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, Optional, Tuple
 
@@ -82,6 +83,66 @@ class OnlineBenchmark:
         if sample == 0:
             return 0.0
         return wins / sample
+
+
+@dataclass
+class DailyCapState:
+    day: Optional[date] = None
+    cumulative: float = 0.0
+    triggered: bool = False
+
+def update_daily_cap(state: DailyCapState, cap: float, ts_ms: int, pnl: float) -> bool:
+    if cap <= 0:
+        return False
+    trade_day = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).date()
+    if state.day != trade_day:
+        state.day = trade_day
+        state.cumulative = 0.0
+        state.triggered = False
+    state.cumulative += pnl
+    if state.triggered:
+        return False
+    if state.cumulative <= -cap:
+        state.triggered = True
+        return True
+    return False
+
+@dataclass
+class LossStreakState:
+    count: int = 0
+    cooldown_until: int = 0
+
+def update_loss_streak(state: LossStreakState, is_loss: bool, max_losses: int, cooldown_ms: int, now_ms: int) -> bool:
+    if max_losses <= 0:
+        state.count = 0
+        return False
+    if is_loss:
+        state.count += 1
+    else:
+        state.count = 0
+    if state.count >= max_losses:
+        if now_ms < state.cooldown_until:
+            state.count = 0
+            return False
+        state.cooldown_until = now_ms + max(cooldown_ms, 0)
+        state.count = 0
+        return True
+    return False
+def est_liq_price_short(entry_price: float, leverage: float, mmr: float) -> float:
+    if entry_price <= 0 or leverage <= 0:
+        return 0.0
+    return max(0.0, entry_price * (1.0 + (1.0 / leverage) - mmr))
+def near_liq_short_block(entry_price: float, leverage: float, mmr: float, assumed_sl_pct: float, sl_buffer_multiplier: float) -> bool:
+    if entry_price <= 0 or leverage <= 0:
+        return False
+    if assumed_sl_pct <= 0:
+        return False
+    liq_price = est_liq_price_short(entry_price, leverage, mmr)
+    if liq_price <= 0 or liq_price <= entry_price:
+        return True
+    distance_pct = (liq_price - entry_price) / entry_price
+    threshold = assumed_sl_pct * max(sl_buffer_multiplier, 0.0)
+    return distance_pct <= threshold
 
 
 class RollbackManager:
@@ -330,6 +391,9 @@ def main():
     risk_settings = cfg.risk.model_copy(update=risk_raw)
     daily_loss_limit = float(risk_settings.daily_loss_limit)
     max_consecutive_losses = int(risk_settings.max_consecutive_losses)
+    daily_loss_cap = float(risk_raw.get("daily_loss_cap_usd") or 0.0)
+    loss_streak_max = int(risk_raw.get("loss_streak_max") or 0)
+    streak_cooldown_ms = int(max(risk_raw.get("session_cooldown_minutes") or 0, 0) * 60 * 1000)
     precision_cfg = risk_settings.precision
     precision_window_len = int(precision_cfg.window)
     precision_window = deque(maxlen=precision_window_len or None)
@@ -363,6 +427,24 @@ def main():
 
     exposure_cfg = risk_settings.exposure
     fail_safe_cfg = risk_settings.fail_safe
+    near_liq_cfg = risk_settings.near_liq_guard
+    assumed_sl_pct_default = float(getattr(risk_settings, "assumed_sl_pct", 0.0) or 0.0)
+    leverage_default = float(getattr(getattr(cfg.executor, "sizing", None), "leverage", 0.0) or 0.0)
+    sl_buffer_multiplier = float(getattr(near_liq_cfg, "sl_buffer_multiplier", 0.0) or 0.0)
+
+    symbol_mmr: Dict[str, float] = {}
+    ref_path = Path("config/exchange_reference.yml")
+    if ref_path.exists():
+        try:
+            raw_refs = yaml.safe_load(ref_path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:
+            log.warning("risk_reference_load_failed", error=str(exc))
+        else:
+            symbol_mmr = {
+                sym: float((meta or {}).get("mmr", 0.004))
+                for sym, meta in raw_refs.items()
+                if meta is not None
+            }
 
     daily_pnl = 0.0
     consecutive_losses = 0
@@ -378,6 +460,8 @@ def main():
     trade_timestamps: Deque[int] = deque()
     trade_clusters: Dict[str, Deque[Tuple[int, float]]] = defaultdict(deque)
     positions: Dict[str, Position] = defaultdict(Position)
+    daily_cap_state = DailyCapState()
+    loss_streak_state = LossStreakState()
 
     def _make_route_stats() -> Dict[str, Any]:
         return {
@@ -570,7 +654,11 @@ def main():
                         continue
 
                     fill = Fill.model_validate(data)
-                    positions[fill.symbol].apply_fill(fill.side.value if hasattr(fill.side, "value") else str(fill.side), fill.price, fill.qty)
+                    now_ms = utc_ms()
+                    positions[fill.symbol].apply_fill(
+                        fill.side.value if hasattr(fill.side, "value") else str(fill.side), fill.price, fill.qty
+                    )
+                    position = positions[fill.symbol]
                     trade_timestamps.append(fill.ts)
                     cutoff_slo = fill.ts - trade_slo_window_ms
                     while trade_timestamps and trade_timestamps[0] < cutoff_slo:
@@ -582,16 +670,41 @@ def main():
                     rs.xadd("metrics:risk", Metric(name="trades_per_hour", value=float(trades_per_hour)))
                     trade_pnl = fill.pnl
                     daily_pnl += trade_pnl
+                    daily_cap_hit = update_daily_cap(daily_cap_state, daily_loss_cap, fill.ts, trade_pnl)
                     trades_total += 1
+                    is_loss = trade_pnl < 0
                     if trade_pnl > 0:
                         wins_total += 1
                         consecutive_losses = 0
+                        is_loss = False
                         precision_window.append(1.0)
                     else:
                         consecutive_losses += 1
                         precision_window.append(0.0)
                     markout_window.append(fill.markout)
                     markout_short_window.append(fill.markout)
+                    loss_streak_trigger = update_loss_streak(
+                        loss_streak_state,
+                        is_loss,
+                        loss_streak_max,
+                        streak_cooldown_ms,
+                        now_ms,
+                    )
+                    near_liq_short_hit = False
+                    if (
+                        near_liq_cfg.enabled
+                        and assumed_sl_pct_default > 0
+                        and leverage_default > 0
+                        and position.qty < 0
+                    ):
+                        mmr_value = symbol_mmr.get(fill.symbol, 0.004)
+                        near_liq_short_hit = near_liq_short_block(
+                            position.avg_price,
+                            leverage_default,
+                            mmr_value,
+                            assumed_sl_pct_default,
+                            sl_buffer_multiplier,
+                        )
 
                     route_label = route_for_order(fill.order_id or "")
                     stats = route_stats[route_label]
@@ -724,7 +837,18 @@ def main():
                             reason = f"trade_rate>{trade_slo_cfg.max_trades}"
 
                     if trigger is None:
-                        if daily_pnl <= daily_loss_limit:
+                        if daily_cap_hit:
+                            trigger = "STOP"
+                            reason = "daily_cap"
+                            rs.xadd("metrics:risk", Metric(name="daily_cap_trigger_total", value=1.0))
+                        elif loss_streak_trigger:
+                            trigger = "STOP"
+                            reason = "streak_halt"
+                            rs.xadd("metrics:risk", Metric(name="streak_halt_total", value=1.0))
+                        elif near_liq_short_hit:
+                            trigger = "STOP"
+                            reason = "near_liquidation_short"
+                        elif daily_pnl <= daily_loss_limit:
                             trigger = "STOP"
                             reason = f"daily_pnl<=limit ({daily_pnl:.4f}<={daily_loss_limit})"
                         elif consecutive_losses >= max_consecutive_losses:
