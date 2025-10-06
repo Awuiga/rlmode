@@ -1,0 +1,29 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual envs
+.venv/
+
+# Local config & secrets
+.env
+.env.*
+*.env
+
+# Local data/services
+data/redis/
+
+# Models (heavy artifacts out of VCS)
+models/**/*.onnx
+models/**/*.pkl
+models/**/*.bin
+
+# Logs
+*.log
+logs/
+
+# OS/IDE
+.DS_Store
+.idea/
+.vscode/

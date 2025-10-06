@@ -1,0 +1,34 @@
+daily_loss_limit: -0.03
+max_consecutive_losses: 5
+precision:
+  window: 60
+  min_precision: 0.55
+  consecutive_windows: 2
+  safety_precision: 0.5
+markout:
+  window: 30
+  min_markout: 0.0
+volatility:
+  enabled: true
+  max_consecutive: 3
+  precision_floor: 0.52
+  debounce_ms: 60000
+trade_cluster:
+  enabled: true
+  window_ms: 120000
+  max_trades: 3
+  cumulative_loss: -0.001
+trade_slo:
+  window_seconds: 3600
+  max_trades: 180
+  alert_only: false
+exposure:
+  max_positions: 5
+  per_symbol:
+    BTCUSDT: 3
+  kelly_fraction: 0.1
+  reference_equity: 10000
+fail_safe:
+  enabled: true
+  mode: paper
+  duration_sec: 600

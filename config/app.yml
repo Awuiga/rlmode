@@ -1,0 +1,301 @@
+# Application configuration
+
+exchange:
+  mode: ${EXCHANGE_MODE:-paper}
+  venue: ${EXCHANGE_VENUE:-bybit_v5}
+  maker_only: true
+  reduce_only: true
+  post_only: true
+
+exchange_mode: live_paper  # live_paper | live_real
+market:
+  use: bybit_v5   # binance_futs | bybit_v5 | fake
+  category: spot            # linear | spot | inverse (Bybit v5 WS category)
+  symbols: [BTCUSDT]
+  binance_ws_public: wss://fstream.binance.com/stream
+  bybit_ws_public:   wss://stream.bybit.com/v5/public
+
+redis:
+  url: ${REDIS_URL:-redis://localhost:6379/0}
+  streams_maxlen: 10000
+  pending_retry:
+    idle_ms: 5000
+    count: 100
+    backoff_ms: [200, 400, 800, 1600]
+
+rollout:
+  mode: "disabled"        # disabled | canary | full
+  canary_fraction: 0.10
+  rng_seed: 1337
+
+warmup:
+  enabled: true
+  seconds: 90
+
+fail_safe:
+  switch_to_paper_on_crit: true
+  cooldown_minutes: 15
+
+backpressure:
+  enabled: true
+  max_queue_len: 10000
+  drop_mode: "halt" # halt | degrade
+
+rollout_guard:
+  winrate_delta_pp: 5
+  min_sample: 50
+  psi_block: 0.30
+  ks_block: 0.20
+  cooldown_minutes: 15
+
+collector:
+  depth_levels: 10
+  ws:
+    binance:
+      url: wss://fstream.binance.com/stream
+    bybit:
+      url: wss://stream.bybit.com/v5/public/linear
+  reconnect_backoff_ms: [500, 1000, 2000, 5000]
+  rate_limit_per_sec: 20
+
+signal_engine:
+  features:
+    depth_top_k: 5
+    qi_levels: 5
+    sigma_window_ms: 1500
+    ofi_window_ms: 1000
+    ema_window_ms: 2000
+    microprice_velocity_window_ms: 200
+    cancel_window_ms: 3000
+    taker_window_ms: 1200
+    regime_window_ms: 60000
+    regime_spread_bins: [0.8, 1.8]
+    regime_vol_bins: [0.0004, 0.0012]
+    regime_depth_bins: [40.0, 120.0]
+    spike_return_threshold: 0.0015
+    spike_ofi_threshold: 6.0
+    spike_vol_mult: 2.5
+    winsor_limits:
+      ofi: 35.0
+      ofi_instant: 18.0
+      microprice_velocity: 0.008
+      cancel_rate_instant: 0.9
+      cancel_rate: 0.9
+      replace_rate_instant: 0.9
+    anomaly_features: [ofi, microprice_velocity, cancel_rate_instant]
+    anomaly_z_limit: 8.0
+    feature_schema_version: "3"
+  rules:
+    min_liquidity: 0.5
+    max_spread_ticks: 3
+    sigma_min: 0.0
+    sigma_max: 1.0
+    ofi_buy_min: 0.001
+    ofi_sell_min: 0.001
+    qi_min: -1.0
+    use_trend: false
+  scoring:
+    weights:
+      spread: -0.2
+      sigma: 0.3
+      ofi: 0.3
+      qi: 0.2
+      depth: 0.2
+    theta_emit: 0.6
+  gates:
+    spread:
+      enabled: true
+      max_ticks: 2.0
+    volatility:
+      enabled: true
+      quantile: 0.9
+      lookback_ms: 60000
+      disable_high_regime: true
+      high_quantile: 0.9
+    liquidity:
+      enabled: true
+      min_bid_qty: 50.0
+      min_ask_qty: 50.0
+      top_levels: 3
+    cross_asset:
+      enabled: true
+      leader_symbol: BTCUSDT
+      max_lag_ms: 400
+      feature: microprice_velocity
+      direction: same
+      debounce_count: 2
+      debounce_window_ms: 200
+    leadlag:
+      enabled: true
+      leader: "BTCUSDT"
+      agree_required:
+        n: 3
+        m: 4
+    anomaly:
+      enabled: true
+      features: [ofi, microprice_velocity, cancel_rate_instant]
+      z_limit: 8.0
+      require_double_confirmation: true
+    session:
+      enabled: false
+      timezone: UTC
+      open_windows: []
+      tighten_multiplier: 1.25
+      news_windows: []
+      post_event_cooldown_ms: 300000
+  tp_pct: 0.006
+  sl_pct: 0.003
+  backpressure:
+    enabled: true
+    pending_threshold: 200
+    release_threshold: 80
+    drop_rate: 0.5
+    check_interval_ms: 500
+
+ais_scorer:
+  model_type: lightgbm_meta
+  model_path: /app/models/lgbm_meta.onnx
+  meta_path: /app/models/lgbm_meta.json
+  thresholds:
+    entry: 0.65
+    hold: 0.45
+    precision_target: 0.65
+  batch_size: 64
+  feature_order: []
+  calibration:
+    enabled: true
+    method: platt
+  use_meta_thresholds: true
+  shadow:
+    enabled: true
+    use_threshold_from_meta: true
+    tau_entry: null
+    tau_hold: null
+  adaptive:
+    enabled: true
+    interval_sec: 300
+    step: 0.02
+    window: 200
+    min_avg_pnl: 0.0
+    safety_precision: 0.55
+    safety_windows: 2
+    freeze_reset_precision: 0.62
+    max_delta: 0.15
+    min_entry: 0.05
+    max_entry: 0.95
+  window:
+    frequency_hz: 50
+    seconds: 2
+    depth_levels: 10
+  batch_inference:
+    enabled: true
+    max_batch: 32
+    flush_interval_ms: 25
+
+executor:
+  ladder:
+    fractions: [0.25, 0.25, 0.25, 0.25]
+    step_ticks: 2
+    use_percent: false
+  tif: GTC
+  post_only: true
+  cancel_timeout_ms: 2500
+  retry_backoff_ms: [200, 400, 800, 1600]
+  adaptive_stop_k: 2.0
+  min_stop: 0.002
+  qi_aggressive_threshold: 0.15
+  passive_step_ticks: 3
+  microprice_guard: true
+  max_active_ladders: 2
+  cooldown_ms: 2000
+  cancel_latency_p95_ms: 1200
+  min_fill_probability: 0.3
+  sizing:
+    leverage: 10
+    notional_cap_usd: 20000
+    use_all_in: true
+    min_free_balance_usd: 200
+    lot_size_rounding: "floor"
+  gates:
+    liquidity_by_side:
+      enabled: true
+      alpha: 1.5
+      levels: 3
+  microprice_flip_guard:
+    enabled: true
+    flips: 2
+    window_ms: 400
+    cooldown_ms: 2000
+  warmup_seconds: 90
+  fail_safe:
+    enabled: true
+    duration_sec: 600
+
+signals:
+  tp_pct: 0.006
+  sl_pct: 0.003
+  score_threshold: 0.65
+  sigma_window_ms: 1500
+  sigma_min: 0.0004
+  sigma_max: 0.0020
+  ofi_thr: 0.10
+  qi_thr:  0.05
+  ladder: [0.25, 0.25, 0.25, 0.25]
+  ladder_step_ticks: 1
+
+execution:
+  mode: ${EXCHANGE_MODE:-paper}
+  simulator:
+    seed: 42
+    base_latency_ms: 15
+    latency_jitter_ms: [2, 8]
+    maker_fill_model: queue
+    taker_slip_bps: [1.0, 4.0]
+    maker_fill_boost_if_qi: 0.15
+    min_partial_fill_qty: 0.25
+    cancel_timeout_ms: 800
+    shock_prob: 0.0005
+    shock_return: [-0.03, -0.10]
+    liquidity_degrade_curve:
+      x: [10000, 50000, 200000, 1000000]
+      y_bps: [1.5, 3.0, 6.0, 20.0]
+
+risk:
+  enable: true
+  precision:
+    window: 50
+    min_precision: 0.55
+    safety_precision: 0.5
+    freeze_step: 0.02
+    consecutive_windows: 2
+  markout:
+    window: 30
+    min_markout: 0.0
+  volatility:
+    enabled: true
+    max_consecutive: 3
+    precision_floor: 0.5
+    debounce_ms: 60000
+  trade_cluster:
+    enabled: false
+    window_ms: 60000
+    max_trades: 3
+    cumulative_loss: -0.0005
+  near_liq_guard:
+    enabled: true
+    sl_buffer_multiplier: 1.5
+  assumed_sl_pct: 0.003
+  fail_safe:
+    enabled: true
+    mode: paper
+    duration_sec: 300
+  backfill_scanner:
+    enabled: true
+    parquet_path: data/parquet
+    timestamp_column: ts
+    gap_threshold_ms: 60000
+    check_interval_sec: 300
+
+monitor:
+  http_host: 0.0.0.0
+  http_port: 8000
