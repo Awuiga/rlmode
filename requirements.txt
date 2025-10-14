@@ -16,3 +16,6 @@ scikit-learn>=1.4
 onnxmltools>=1.11
 onnxconverter-common>=1.14
 matplotlib>=3.8
+gymnasium>=0.29
+torch>=2.2
+tensorboard>=2.16

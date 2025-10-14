@@ -40,6 +40,15 @@ Advanced toolkit
 - `scripts/validate_symbols.py` cross-checks symbol parameters against reference maker/taker fees.
 - `scripts/validate_config.py` ensures `config/app.yml` satisfies Pydantic schema.
 - `scripts/profile_service.py` runs cProfile on any entrypoint for latency budgeting.
+- `app/rl/daily_env.py` hosts a Gymnasium-compatible environment that optimises daily PnL with hindsight bonuses and trade-count penalties.
+- `app/rl/branching_dqn.py` provides a dueling branching DQN (price + size heads) ready to plug into the RL training loop.
+- `app/rl/reward_fn.py` exposes `calculate_reward` for daily PnL shaped rewards in Gym environments.
+- `app/rl/metrics.py` implements `calculate_metrics` for Sharpe/Sortino/drawdown/winrate reporting during training.
+- `app/rl/multi_stream_encoder.py` merges tick-level LSTM features with macro indicators into a unified state embedding.
+- `app/rl/risk_branching_dqn.py` extends the branching DQN with a volatility head and combined training loss.
+- `app/rl/trading_env.py` implements a Gymnasium trading simulator with fees, slippage, trade caps and capital-based rewards.
+- `app/rl/train_loop.py` contains a full DQN training loop with checkpoints, TensorBoard logging, and early stopping.
+- `logger.py` is a standalone utility that streams metrics to TensorBoard/CSV and produces PDF/PNG reports.
 
 Operational docs
 - `docs/model_card.md` summarises dataset, metrics and assumptions for the latest model.
