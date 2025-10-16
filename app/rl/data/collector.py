@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -14,7 +15,7 @@ import numpy as np
 import pandas as pd
 import httpx
 
-from ...features.core import compute_features_offline, make_feature_state
+from ...features import FeaturePipeline, split_by_regime
 from ...common.config import load_app_config
 from ..data.fetchers import (
     BinanceFundingFetcher,
@@ -42,6 +43,7 @@ class HistoricalDataConfig:
     feature_depth_top_k: int = 10
     chunk_days: int = 7
     tz: timezone = timezone.utc
+    split: str = "train"
 
 
 def daterange(start: datetime, end: datetime, step: timedelta) -> Iterable[datetime]:
@@ -67,7 +69,16 @@ class HistoricalDataCollector:
         self.output_dir = cfg.output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.feature_cfg = make_feature_state_config(feature_config_path)
-        self.feature_state = make_feature_state(self.feature_cfg)
+        self.pipeline = FeaturePipeline(
+            feature_config=self.feature_cfg,
+            depth_top_k=self.cfg.feature_depth_top_k,
+            ts_column="ts",
+            price_column="price",
+            raw_cache_dir=self.output_dir / "raw",
+            feature_store_dir=self.output_dir / "features",
+            progress=True,
+        )
+        self._normalization_initialized = False
         self.spot_fetcher = spot_fetcher or BinanceSpotFetcher(symbol=cfg.symbol)
         symbol_funding = cfg.funding_symbol or f"{cfg.symbol}USDT"
         self.funding_fetcher = funding_fetcher or BinanceFundingFetcher(symbol=symbol_funding)
@@ -93,7 +104,7 @@ class HistoricalDataCollector:
             trades_task, lob_task, funding_task, onchain_task
         )
 
-        dataset = self._build_dataset(trades, lob_frames, funding, onchain)
+        dataset = self._build_dataset(trades, lob_frames, funding, onchain, chunk_start, chunk_end)
         out_file = self._chunk_path(chunk_start, chunk_end)
         out_file.parent.mkdir(parents=True, exist_ok=True)
         dataset.to_parquet(out_file, index=False)
@@ -167,6 +178,8 @@ class HistoricalDataCollector:
         lob_frames: List[pd.DataFrame],
         funding: pd.DataFrame,
         onchain: pd.DataFrame,
+        chunk_start: datetime,
+        chunk_end: datetime,
     ) -> pd.DataFrame:
         if not lob_frames:
             raise ValueError("LOB frames are empty; ensure depth archives are available.")
@@ -204,28 +217,80 @@ class HistoricalDataCollector:
             merged = merged.merge(onchain, on="ts", how="left")
             merged.fillna(method="ffill", inplace=True)
 
-        features = self._compute_features(merged)
+        features = self._compute_features(merged, chunk_start, chunk_end)
         return features
 
-    def _compute_features(self, merged: pd.DataFrame) -> pd.DataFrame:
-        rows: List[Dict[str, object]] = []
-        for rec in merged.to_dict(orient="records"):
-            feature_values = compute_features_offline(
-                rec,
-                state=self.feature_state,
-                depth_top_k=self.cfg.feature_depth_top_k,
-            )
-            enriched = {**rec, **feature_values}
-            rows.append(enriched)
-        frame = pd.DataFrame.from_records(rows)
-        frame = frame.sort_values("ts").reset_index(drop=True)
-
-        micro_window = self.cfg.micro_window_seconds
-        frame["realized_volatility"] = (
-            frame["price"].pct_change().rolling(window=micro_window).std().fillna(0.0)
+    def _compute_features(
+        self,
+        merged: pd.DataFrame,
+        chunk_start: datetime,
+        chunk_end: datetime,
+    ) -> pd.DataFrame:
+        merged = merged.copy()
+        merged["symbol"] = self.cfg.symbol
+        refresh_stats = False
+        if self.cfg.split == "train" and not getattr(self, "_normalization_initialized", False):
+            refresh_stats = True
+        enriched = self.pipeline.run(
+            merged,
+            symbol=self.cfg.symbol,
+            cache_raw=True,
+            materialize=True,
+            split=self.cfg.split,
+            refresh_stats=refresh_stats,
         )
-        frame["cumulative_volume"] = frame["qty"].rolling(window=micro_window).sum().fillna(0.0)
-        return frame
+        if self.cfg.split == "train":
+            self._normalization_initialized = True
+        micro_window = self.cfg.micro_window_seconds
+        if "qty" in enriched.columns:
+            enriched["cumulative_volume"] = (
+                enriched["qty"].rolling(window=micro_window, min_periods=1).sum().fillna(0.0)
+            )
+        regimes = split_by_regime(
+            enriched,
+            price_column="price",
+            vol_window=self.pipeline.regime_vol_window,
+            trend_window=self.pipeline.regime_trend_window,
+            vol_threshold=self.pipeline.regime_vol_threshold,
+            volatility_bins=self.pipeline.volatility_bins,
+        )
+        self._materialize_regimes(regimes, chunk_start, chunk_end)
+        return enriched
+
+    def _materialize_regimes(
+        self,
+        regimes: Dict[str, pd.DataFrame],
+        chunk_start: datetime,
+        chunk_end: datetime,
+    ) -> None:
+        regime_dir = self.output_dir / "regimes"
+        regime_dir.mkdir(parents=True, exist_ok=True)
+        for regime, frame in regimes.items():
+            if frame.empty:
+                continue
+            file_name = (
+                f"{self.cfg.symbol}_{regime}_{chunk_start.strftime('%Y%m%d')}_{chunk_end.strftime('%Y%m%d')}.parquet"
+            )
+            output_path = regime_dir / file_name
+            frame.to_parquet(
+                output_path,
+                index=False,
+                engine="pyarrow",
+                compression="zstd",
+                use_dictionary=True,
+            )
+            metrics_dir = regime_dir / "metrics"
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+            vol_counts = frame.get("vol_bucket", pd.Series()).value_counts(dropna=False).to_dict()
+            metrics_payload = {
+                "regime": regime,
+                "rows": int(len(frame)),
+                "start_ts": frame["ts"].iloc[0].isoformat(),
+                "end_ts": frame["ts"].iloc[-1].isoformat(),
+                "vol_bucket_counts": {str(k): int(v) for k, v in vol_counts.items()},
+            }
+            metrics_name = file_name.replace(".parquet", "_metrics.json")
+            (metrics_dir / metrics_name).write_text(json.dumps(metrics_payload, indent=2))
 
     def _chunk_path(self, chunk_start: datetime, chunk_end: datetime) -> Path:
         start_str = chunk_start.strftime("%Y%m%d")
@@ -253,21 +318,37 @@ async def download_binance_lob(*, symbol: str, day: datetime, levels: int) -> pd
             if inner is None:
                 raise ValueError(f"zip archive {filename} missing csv")
             with zf.open(inner) as csv_file:
-                df = pd.read_csv(
-                    csv_file,
-                    names=["ts", "bid_px", "bid_qty", "ask_px", "ask_qty"],
-                    header=None,
-                )
+                columns = ["ts"]
+                for level in range(1, levels + 1):
+                    columns.extend(
+                        [
+                            f"bid_px_{level}",
+                            f"bid_qty_{level}",
+                            f"ask_px_{level}",
+                            f"ask_qty_{level}",
+                        ]
+                    )
+                df = pd.read_csv(csv_file, names=columns, header=None)
         df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        if "bid_px" not in df.columns and "bid_px_1" in df.columns:
+            df["bid_px"] = df["bid_px_1"]
+        if "ask_px" not in df.columns and "ask_px_1" in df.columns:
+            df["ask_px"] = df["ask_px_1"]
+        if "bid_qty" not in df.columns and "bid_qty_1" in df.columns:
+            df["bid_qty"] = df["bid_qty_1"]
+        if "ask_qty" not in df.columns and "ask_qty_1" in df.columns:
+            df["ask_qty"] = df["ask_qty_1"]
         df["spread"] = df["ask_px"] - df["bid_px"]
         df["mid"] = 0.5 * (df["ask_px"] + df["bid_px"])
-        df["depth_bids"] = df["bid_qty"]
-        df["depth_asks"] = df["ask_qty"]
+        bid_qty_cols = [f"bid_qty_{level}" for level in range(1, levels + 1) if f"bid_qty_{level}" in df.columns]
+        ask_qty_cols = [f"ask_qty_{level}" for level in range(1, levels + 1) if f"ask_qty_{level}" in df.columns]
+        df["depth_bids"] = df[bid_qty_cols].sum(axis=1) if bid_qty_cols else df["bid_qty"]
+        df["depth_asks"] = df[ask_qty_cols].sum(axis=1) if ask_qty_cols else df["ask_qty"]
         df["depth_imbalance"] = np.divide(
-            df["bid_qty"] - df["ask_qty"],
-            df["bid_qty"] + df["ask_qty"],
-            out=np.zeros_like(df["bid_qty"], dtype=float),
-            where=(df["bid_qty"] + df["ask_qty"]) != 0,
+            df["depth_bids"] - df["depth_asks"],
+            df["depth_bids"] + df["depth_asks"],
+            out=np.zeros_like(df["depth_bids"], dtype=float),
+            where=(df["depth_bids"] + df["depth_asks"]) != 0,
         )
         return df
 

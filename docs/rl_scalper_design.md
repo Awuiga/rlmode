@@ -14,15 +14,19 @@
   - Async REST clients with cursor/pagination handling and throttling.
   - Converts raw API responses into normalized records (`TradeTick`, `OrderBookLevel`, `FundingRate`, `OnChainMetric` dataclasses).
 - **Orchestration (`HistoricalDataCollector`)**
-  - Drives multi-source downloads, persists to Parquet under `data/raw/<symbol>/YYYY/MM/DD`.
-  - Computes derived book features: spread, micro/macro depths, imbalance, OFI, realized volatility.
-  - Aligns funding/on-chain series to tick timeline using forward-fill with latency guards.
-- **Regime Splitter (`MarketRegimeSplitter`)**
-  - Segments history into bull/bear/range using rolling return and volatility thresholds.
-  - Produces train/validation/test manifests ensuring coverage of each regime.
+  - Streams multi-source downloads through `FeaturePipeline`, which partitions raw parquet caches under `output/raw/date=*`.
+  - Modular transforms cover spread, multi-depth imbalance (L1/L3/L5/L10), queue proxies, realized volatility, microprice, OFI, skew, kurtosis, and mid-price markouts with automatic QC (timestamp continuity, L2/trade sync, anomaly clipping).
+  - Normalization statistics (mean/std) are locked on the train split and persisted as sidecar metadata for leak-free reuse in validation/inference.
+  - All parquet outputs rely on `compression="zstd"` with dictionary encoding to shrink IO latency on large days.
+  - tqdm + loguru monitoring reports tick volumes, lag counts, depth averages, spread regimes, p99 metrics, and exports JSON counters alongside parquet drops.
+- **Regime Splitter (`split_by_regime`)**
+  - Uses rolling volatility and trend direction to tag bull/bear/range phases via `app.features.split_by_regime`.
+  - Collector materializes per-regime parquet shards in `output/regimes/<phase>` for stratified sampling.
+  - Roadmap: integrate Bayesian change-point/HMM segmentation once volatility labelling stabilises across markets.
 - **Feature Materialization**
-  - Invokes `app.features.compute_features_offline` for consistency with production stack.
-  - Stores model-ready tensors in `data/processed/<split>/<symbol>/*.npz`.
+  - Pipeline emits feature parquet partitions with metadata manifests (`metadata.json`) covering transforms, QC thresholds, schema hash/signature, normalization stats, and regime/volatility coverage.
+  - Daily metrics JSON (gaps_rate, max_gap, best lag/corr, p99 spread/depth change) land under `output/features/metrics/` for dashboards.
+  - Downstream training consumes `output/features/partition=*/*.parquet` aligned with live feature schema; loading enforces schema-hash verification to fail-fast on drift.
 
 ## Simulation Environment
 - **ABIDES Integration (`app/rl/abides_env.py`)**
@@ -77,4 +81,3 @@
 - Model registry entry with metadata (data ranges, metrics, risk parameters).
 - Export TorchScript/ONNX policy + encoder; package risk/leverage config for live executor.
 - Integration tests simulate shadow trading using `scripts/canary_pipeline.py`.
-

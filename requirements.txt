@@ -20,3 +20,5 @@ gymnasium>=0.29
 torch>=2.2
 tensorboard>=2.16
 optuna>=3.6
+loguru>=0.7
+tqdm>=4.66
