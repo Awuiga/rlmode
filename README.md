@@ -19,6 +19,13 @@ Model pipeline recipe
 - simulate using `scripts/canary_pipeline.py` across normal/event/high-vol days
 - deploy by copying the ONNX and metadata into `models/` and restarting `ai_scorer`
 
+### RL Scalper pipeline
+
+- Collect historical spot + L2 order book data, funding, and on-chain metrics with `python scripts/download_rl_dataset.py --symbol BTCUSDT --start 2023-01-01T00:00:00 --end 2024-01-01T00:00:00`.
+- Train the risk-aware branching DQN agent via `python -m app.rl.scalper_train --dataset data/processed/train.npz --episodes 300 --device cuda`.
+- Evaluate vs baselines: `python scripts/evaluate_scalper.py --dataset data/processed/test.npz --model runs/scalper/best_model.pt`.
+- Detailed architecture and workflow notes: `docs/rl_scalper_design.md`, `docs/rl_scalper_workflow.md`.
+
 Release checklist
 - feature schema hash matches between parquet sidecars and the exported ONNX metadata
 - PR-AUC and precision targets meet or beat the current benchmark in `models/latest/lgbm_meta.json`
